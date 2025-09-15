@@ -1,2 +1,5 @@
 [phases.setup]
+
 aptPkgs = ["ffmpeg"]
+
+cmd = "python bot.py"
