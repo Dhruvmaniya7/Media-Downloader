@@ -221,7 +221,7 @@ async def queue_download(update: Update, context: ContextTypes.DEFAULT_TYPE, cus
 # ---------------- Handlers ----------------
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_name = update.effective_user.first_name or "User"
-    caption = (f"👋 Hello, *{user_name}*!\n\nSend me a link to get started.\n\n*Commands:*\n`/sites`\n`/cancel`")
+    caption = (f"👋 Hello, *{user_name}*!\n\nSend me a link to get started.\n\n*Commands:*\n`/sites`\n`/cancel`\n\n created by shadow maniya")
     try: await update.message.reply_photo(photo=WELCOME_IMAGE_URL, caption=caption, parse_mode=ParseMode.MARKDOWN)
     except Exception: await update.message.reply_markdown(caption)
 
@@ -432,3 +432,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
