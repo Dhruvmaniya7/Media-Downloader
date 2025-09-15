@@ -207,6 +207,7 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/video <url> - Direct video\n"
         "/sites - Supported sites\n"
         "/cancel - Cancel your queued downloads"
+        "created by shadow maniya...!"
     )
 
 async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -585,4 +586,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
