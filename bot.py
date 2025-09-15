@@ -15,16 +15,12 @@ from telegram.ext import (
 
 # --- ⚙️ CONFIGURATION & CONSTANTS ⚙️ ---
 CREATOR_NAME = "shadow maniya"
-CONNECT_LINK = "https://www.linkedin.com/in/dhruv-maniya-shadow03"
+CONNECT_LINK = "https://dhruvmaniyaportfolio.vercel.app/"
 WELCOME_IMAGE_URL = "https://i.ibb.co/bMNj87bT/download.jpg"
-MAX_DURATION = 900  # Safety limit: 15 minutes (in seconds)
-MAX_FILE_SIZE_MB = 49.5 # Safety limit for Telegram uploads
-
-# --- ✨ ANIMATIONS ✨ ---
-PROCESSING_ANIMATION = ["⚙️ Processing", "⚙️⚙️ Processing.", "⚙️⚙️⚙️ Processing..", "⚙️⚙️⚙️⚙️ Processing..."]
+MAX_FILE_SIZE_MB = 49.5
 
 # --- 💡 CONVERSATION STATES 💡 ---
-CHOOSE_FORMAT = range(1)
+CHOOSE_FORMAT, CHOOSE_QUALITY = range(2)
 
 # --- Bot Setup ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -37,65 +33,29 @@ async def upload_to_0x0(file_path):
     try:
         with open(file_path, 'rb') as f:
             response = requests.post('https://0x0.st', files={'file': f})
-        if response.status_code == 200:
-            return response.text.strip()
-        else:
-            logger.error(f"0x0.st upload failed with status {response.status_code}")
-            return None
+        if response.status_code == 200: return response.text.strip()
+        else: return None
     except Exception as e:
         logger.error(f"0x0.st upload failed: {e}")
         return None
 
-async def update_progress_message(d, context: ContextTypes.DEFAULT_TYPE, message):
-    """The progress hook function for yt-dlp to show real-time progress."""
-    if d['status'] == 'downloading':
-        now = time.time()
-        # Update every 2 seconds to avoid spamming Telegram API
-        if now - context.bot_data.get('last_update', 0) < 2:
-            return
-        
-        progress_text = (f"Downloading...\n"
-                         f"📈 **Progress**: `{d['_percent_str']}`\n"
-                         f"💨 **Speed**: `{d['_speed_str']}`\n"
-                         f"⏳ **ETA**: `{d['_eta_str']}`")
-        try:
-            await context.bot.edit_message_text(
-                text=progress_text, chat_id=message.chat_id,
-                message_id=message.message_id, parse_mode=ParseMode.MARKDOWN)
-            context.bot_data['last_update'] = now
-        except:  # Ignore errors like "message not modified"
-            pass
-    elif d['status'] == 'finished':
-        # Animate the "processing" message after download finishes
-        for frame in PROCESSING_ANIMATION:
-            try:
-                await context.bot.edit_message_text(text=frame, chat_id=message.chat_id, message_id=message.message_id)
-                await asyncio.sleep(0.5)
-            except:
-                break
-
 # --- Main Download Logic ---
-async def download_media(chat_id, url, format_choice, context: ContextTypes.DEFAULT_TYPE):
-    processing_message = await context.bot.send_message(chat_id=chat_id, text="🔄 Preparing download...")
+async def download_media(chat_id, url, format_choice, quality_id, context: ContextTypes.DEFAULT_TYPE):
+    processing_message = await context.bot.send_message(chat_id=chat_id, text="🔄 Preparing to download...")
     
-    progress_hook = lambda d: asyncio.ensure_future(update_progress_message(d, context, processing_message))
-    
-    ydl_opts = {
-        'noplaylist': True,
-        'logger': logger,
-        'outtmpl': '%(title)s.%(ext)s',
-        'progress_hooks': [progress_hook] # <-- ADDED PROGRESS HOOK BACK
-    }
+    ydl_opts = {'noplaylist': True, 'logger': logger, 'outtmpl': '%(title)s.%(ext)s'}
 
     if format_choice == 'mp3':
         ydl_opts['format'] = 'bestaudio/best'
         ydl_opts['postprocessors'] = [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '320'}]
-    else:
-        ydl_opts['format'] = 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best'
+    else: # mp4
+        # Use the specific quality ID the user selected
+        ydl_opts['format'] = f'{quality_id}+bestaudio[ext=m4a]/best[ext=mp4]/best'
 
     file_path = None
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            await processing_message.edit_text("⏳ Downloading media... This may take a moment.")
             info_dict = ydl.extract_info(url, download=True)
             original_file_path = ydl.prepare_filename(info_dict)
             
@@ -127,7 +87,7 @@ async def download_media(chat_id, url, format_choice, context: ContextTypes.DEFA
         await context.bot.send_message(chat_id=chat_id, text=f"✅ Task complete! Connect with *{CREATOR_NAME}* here: {CONNECT_LINK}", parse_mode=ParseMode.MARKDOWN)
 
     except Exception as e:
-        error_message = f"❌ **An error occurred**\n\n`{str(e)}`"
+        error_message = f"❌ **An error occurred during download**\n\n`{str(e)}`"
         await processing_message.edit_text(error_message, parse_mode=ParseMode.MARKDOWN)
         logger.error(f"Error processing link: {e}", exc_info=True)
     finally:
@@ -142,19 +102,14 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         with yt_dlp.YoutubeDL({'noplaylist': True, 'quiet': True}) as ydl:
             info_dict = ydl.extract_info(url, download=False)
-            duration = info_dict.get('duration', 0)
-
-        # ADDED DURATION CHECK BACK
-        if duration > MAX_DURATION:
-            error_message = f"❌ *Video is too long!* This bot's limit is {MAX_DURATION // 60} minutes to keep things running smoothly."
-            await pre_check_message.edit_text(text=error_message, parse_mode=ParseMode.MARKDOWN)
-            return ConversationHandler.END
         
         context.user_data['url'] = url
+        context.user_data['info_dict'] = info_dict  # Store the whole info dict
+
         keyboard = [[InlineKeyboardButton("🎬 Video (MP4)", callback_data='mp4'),
                      InlineKeyboardButton("🎵 Audio (MP3)", callback_data='mp3')]]
         reply_markup = InlineKeyboardMarkup(keyboard)
-        duration_str = time.strftime('%H:%M:%S', time.gmtime(duration))
+        duration_str = time.strftime('%H:%M:%S', time.gmtime(info_dict.get('duration', 0)))
         preview_text = (f"**Title:** {info_dict.get('title')}\n"
                         f"**Duration:** {duration_str}\n\n"
                         "Please choose your desired format:")
@@ -164,25 +119,68 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     except Exception as e:
         await pre_check_message.edit_text(f"❌ Could not process the link. It might be private or from an unsupported site.")
-        logger.error(f"Pre-check failed for {url}: {e}")
         return ConversationHandler.END
 
 async def choose_format_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    url = context.user_data.get('url')
-    format_choice = query.data
     
-    if not url:
+    context.user_data['format_choice'] = query.data
+    info_dict = context.user_data.get('info_dict')
+
+    if query.data == 'mp3':
+        # For audio, we don't need to ask for quality, just get the best
+        await query.edit_message_text(text="Great! Preparing to get the best quality **MP3** for you.")
+        await download_media(query.message.chat_id, context.user_data['url'], 'mp3', 'bestaudio', context)
+        return ConversationHandler.END
+    
+    # For video, create quality selection buttons
+    formats = info_dict.get('formats', [])
+    quality_buttons = []
+    unique_qualities = {}
+    
+    for f in formats:
+        # Filter for mp4 files that contain both video and audio
+        if f.get('vcodec') != 'none' and f.get('acodec') != 'none' and f.get('ext') == 'mp4':
+            height = f.get('height')
+            format_id = f.get('format_id')
+            # Use a dictionary to only get one button per resolution
+            if height and height not in unique_qualities:
+                unique_qualities[height] = format_id
+    
+    # Sort qualities from high to low
+    sorted_qualities = sorted(unique_qualities.items(), key=lambda item: item[0], reverse=True)
+    
+    for height, format_id in sorted_qualities:
+        quality_buttons.append([InlineKeyboardButton(f"{height}p", callback_data=format_id)])
+
+    if not quality_buttons:
+        await query.edit_message_text("Sorry, I couldn't find any standard MP4 video formats. Please try another link.")
+        return ConversationHandler.END
+
+    reply_markup = InlineKeyboardMarkup(quality_buttons)
+    await query.edit_message_text("Please choose your desired video quality:", reply_markup=reply_markup)
+    return CHOOSE_QUALITY
+
+async def choose_quality_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    quality_id = query.data
+    url = context.user_data.get('url')
+    format_choice = context.user_data.get('format_choice')
+
+    if not url or not format_choice:
         await query.edit_message_text("Sorry, something went wrong. Please send the link again.")
         return ConversationHandler.END
-        
-    await query.edit_message_text(f"Great! Preparing to get the **{format_choice.upper()}** for you.")
-    await download_media(query.message.chat_id, url, format_choice, context)
+
+    await query.edit_message_text(f"Perfect! Getting the video for you.")
+    await download_media(query.message.chat_id, url, format_choice, quality_id, context)
     return ConversationHandler.END
 
 # --- Standard Commands ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # ... (start command code remains the same)
     user_name = update.effective_user.first_name
     welcome_caption = (f"👋 Hello, {user_name}!\n\nI am the **Ultimate Media Downloader**, created by *{CREATOR_NAME}*.\n\n"
                        "Send me a link from YouTube, TikTok, Instagram, X (Twitter), and more to begin.")
@@ -190,11 +188,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                  parse_mode=ParseMode.MARKDOWN)
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # ... (help command code remains the same)
     help_text = ("**How to use this bot:**\n\n"
-                 "1. Send a link from a supported site.\n"
-                 "2. I'll show you a preview.\n"
+                 "1. Send me a link to a video.\n"
+                 "2. I will show you a preview.\n"
                  "3. Choose your format (Video/Audio).\n"
-                 "4. I'll download it. If it's too big, I'll send a link.\n\n"
+                 "4. If you chose video, select a quality.\n"
+                 "5. I'll download it. If it's too big, I'll send a link.\n\n"
                  "Use /cancel to stop any operation.")
     await update.message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN)
 
@@ -214,7 +214,8 @@ def main():
     conv_handler = ConversationHandler(
         entry_points=[MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link)],
         states={
-            CHOOSE_FORMAT: [CallbackQueryHandler(choose_format_callback)]
+            CHOOSE_FORMAT: [CallbackQueryHandler(choose_format_callback)],
+            CHOOSE_QUALITY: [CallbackQueryHandler(choose_quality_callback)], # NEW STATE
         },
         fallbacks=[CommandHandler('cancel', cancel)],
         conversation_timeout=600 # 10 minute timeout
