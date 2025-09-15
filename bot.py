@@ -221,7 +221,7 @@ async def queue_download(update: Update, context: ContextTypes.DEFAULT_TYPE, cus
 # ---------------- Handlers ----------------
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_name = update.effective_user.first_name or "User"
-    caption = (f"👋 Hello, *{user_name}*!\n\nSend me a link to get started.\n\n*Commands:*\n`/sites`\n`/cancel`\n\n created by shadow maniya")
+    caption = (f"👋 Hello, *{user_name}*!\n\nSend me a link to get started.\n\n*Commands:*\n`/sites`\n`/cancel`")
     try: await update.message.reply_photo(photo=WELCOME_IMAGE_URL, caption=caption, parse_mode=ParseMode.MARKDOWN)
     except Exception: await update.message.reply_markdown(caption)
 
@@ -236,7 +236,8 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     info = None
     try:
         ydl_opts = {'quiet': True, 'noplaylist': True, 'skip_download': True}
-        if COOKIE_FILE.exists(): ydl_opts['cookiefile'] = str(COOKIE_FILE)
+        if COOKIE_FILE.exists():
+            ydl_opts['cookiefile'] = str(COOKIE_FILE)
         
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = await to_thread(ydl.extract_info, url, download=False)
@@ -282,7 +283,15 @@ async def choose_format_callback(update: Update, context: ContextTypes.DEFAULT_T
             buttons.append([InlineKeyboardButton(label, callback_data=f"quality|{f['format_id']}")])
 
     if not buttons: buttons.append([InlineKeyboardButton("Best Available", callback_data="quality|best")])
-    buttons.sort(key=lambda b: int(re.search(r'(\d+)p', b[0].text).group(1)) if re.search(r('(\d+)p', b[0].text) else 0, reverse=True)
+    
+    # --- THIS IS THE CRITICAL SYNTAX FIX ---
+    # The mismatched parenthesis has been corrected.
+    buttons.sort(
+        key=lambda b: int(re.search(r'(\d+)p', b[0].text).group(1)) if re.search(r'(\d+)p', b[0].text) else 0,
+        reverse=True
+    )
+    # ----------------------------------------
+    
     await query.edit_message_text("Please select a video quality:", reply_markup=InlineKeyboardMarkup(buttons))
     return CHOOSE_QUALITY
 
@@ -329,7 +338,6 @@ async def download_media(task: Dict[str, Any], application: Application):
     try:
         start_time = time.monotonic()
         
-        # This dictionary is now corrected and robust
         ydl_opts = {
             'noplaylist': True, 'quiet': True, 'progress_hooks': [progress.get_progress_hook(start_time)],
             'outtmpl': str(DOWNLOAD_DIR / (f"{task['custom_filename']}.%(ext)s" if task['custom_filename'] else "%(title)s.%(ext)s")),
@@ -348,12 +356,11 @@ async def download_media(task: Dict[str, Any], application: Application):
             })
         else: # mp4
             ydl_opts['format'] = f"{task['quality_id']}+bestaudio/best" if task['quality_id'] != 'best' else 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best'
-            # THE TYPO IS FIXED HERE: 'preferedformat' (one 'r') is correct.
             ydl_opts.setdefault('postprocessors', []).append({'key': 'FFmpegVideoConvertor', 'preferedformat': 'mp4'})
         
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info_dict = await to_thread(ydl.extract_info, url, download=True)
-
+            
             final_path_str = ydl.prepare_filename(info_dict)
             if not final_path_str:
                 raise FileNotFoundError("Could not determine final file path from yt-dlp.")
@@ -367,7 +374,7 @@ async def download_media(task: Dict[str, Any], application: Application):
             if not final_path.exists():
                 raise FileNotFoundError(f"File not found at expected path: {final_path}")
         
-        if final_path.stat().st_size < 1024: # Check for junk files
+        if final_path.stat().st_size < 1024:
              raise ValueError(f"Downloaded file is suspiciously small ({final_path.stat().st_size} bytes). Download likely failed.")
 
         await progress.update(generate_progress_text("Uploading..."))
@@ -391,9 +398,8 @@ async def download_media(task: Dict[str, Any], application: Application):
 
 # ---------------- Application Bootstrap ----------------
 def main():
-    # Check for FFmpeg on startup
     if not shutil.which("ffmpeg"):
-        logger.error("FATAL ERROR: FFmpeg is not installed or not in PATH. The bot cannot function without it.")
+        logger.error("FATAL ERROR: FFmpeg is not installed or not in PATH. Please install it.")
         return
     logger.info("FFmpeg found, proceeding with startup.")
 
@@ -432,4 +438,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
