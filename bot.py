@@ -5,8 +5,8 @@ Author: Dhruv Maniya (shadow maniya)
 
 Features:
 - yt-dlp with robust, browser-like options and COOKIE SUPPORT to bypass blocks.
-- aiohttp for non-blocking uploads.
-- Corrected, thread-safe progress updates.
+- aiohttp for non-blocking, reliable uploads.
+- Live, animated, and thread-safe progress bar updates visible to the user.
 - Per-user queue with JSON persistence.
 - Global concurrency limit with asyncio.Semaphore.
 - PicklePersistence for conversation state.
@@ -27,6 +27,7 @@ from typing import Dict, Any, List, Optional
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
+from telegram.error import TelegramError
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -72,6 +73,8 @@ DOWNLOAD_SEMAPHORE = asyncio.Semaphore(GLOBAL_MAX_CONCURRENT_DOWNLOADS)
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
+# Suppress noisy logs from httpx
+logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 
@@ -137,19 +140,22 @@ async def upload_file(file_path: Path) -> Optional[str]:
     if link:
         return link
     logger.warning("Gofile upload failed.")
-    return None # Other uploaders can be added here as a fallback
+    return None # Fallback uploaders can be added here if needed
 
 async def upload_to_gofile(file_path: str) -> Optional[str]:
     try:
-        async with aiohttp.ClientSession() as session:
+        # Define a timeout for the entire session
+        timeout = aiohttp.ClientTimeout(total=300) # 5 minutes total timeout
+        async with aiohttp.ClientSession(timeout=timeout) as session:
             with open(file_path, "rb") as f:
                 data = aiohttp.FormData()
                 data.add_field("file", f, filename=Path(file_path).name)
-                async with session.post("https://store1.gofile.io/uploadFile", data=data, timeout=300) as resp:
+                async with session.post("https://store1.gofile.io/uploadFile", data=data) as resp:
+                    resp.raise_for_status() # Raise an exception for bad status codes
                     resp_json = await resp.json()
                     return resp_json.get("data", {}).get("downloadPage")
-    except Exception:
-        logger.exception("Gofile upload failed")
+    except Exception as e:
+        logger.exception(f"Gofile upload failed: {e}")
         return None
 
 # ---------------- Queue Operations ----------------
@@ -160,9 +166,9 @@ async def process_queue_for_user(user_id: str, application: Application):
         try:
             async with DOWNLOAD_SEMAPHORE:
                 logger.info(f"Starting download for user {user_id}: {task['url']}")
-                await download_media(task=task, context=application)
+                await download_media(task=task, application=application)
         except Exception:
-            logger.exception(f"Error processing task for user {user_id}")
+            logger.exception(f"Critical error in processing task for user {user_id}")
         await asyncio.sleep(1)
 
 async def queue_download(update: Update, context: ContextTypes.DEFAULT_TYPE, custom_filename: Optional[str]):
@@ -183,7 +189,7 @@ async def queue_download(update: Update, context: ContextTypes.DEFAULT_TYPE, cus
     message_text = f"✅ Task added to your queue at position #{position}."
     if update.callback_query:
         await update.callback_query.edit_message_text(message_text)
-    else: # From a message handler (after renaming)
+    else:
         await update.message.reply_text(message_text)
 
 
@@ -303,38 +309,53 @@ async def cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     return ConversationHandler.END
 
 # ---------------- Download Core Logic ----------------
-async def download_media(task: Dict[str, Any], context: Application):
-    chat_id, url, format_choice, quality_id, custom_filename = [task[k] for k in ['chat_id', 'url', 'format_choice', 'quality_id', 'custom_filename']]
-    status_msg = await context.bot.send_message(chat_id, generate_progress_text("Initializing..."), parse_mode=ParseMode.MARKDOWN)
-    start_time = time.monotonic()
+async def download_media(task: Dict[str, Any], application: Application):
+    chat_id = task['chat_id']
+    url = task['url']
+    status_msg = await application.bot.send_message(chat_id, generate_progress_text("Initializing..."), parse_mode=ParseMode.MARKDOWN)
+    
     last_update_time = 0
     final_path = None
+    current_progress_text = ""
 
-    # This hook is called from a separate thread by yt-dlp
+    # This hook is called from a separate (non-async) thread by yt-dlp.
+    # It needs to schedule the async `edit_message_text` call on the main event loop.
     def progress_hook(d):
-        nonlocal last_update_time
+        nonlocal last_update_time, current_progress_text
         try:
-            # Get the running event loop in the main thread
+            # Get the running event loop in the main thread where the bot lives.
             loop = asyncio.get_running_loop()
             now = time.time()
-            if d['status'] == 'downloading' and now - last_update_time > 2.5:
+            if d['status'] == 'downloading' and now - last_update_time > 2.5: # Rate limit updates to Telegram
                 last_update_time = now
                 percent = float(d.get('_percent_str', '0%').replace('%', '').strip() or 0)
-                text = generate_progress_text("Downloading", percent, d.get('_speed_str'), d.get('_eta_str'), format_elapsed(time.monotonic() - start_time))
                 
-                # Safely schedule the coroutine on the main event loop
-                asyncio.run_coroutine_threadsafe(
-                    status_msg.edit_text(text, parse_mode=ParseMode.MARKDOWN),
-                    loop
+                # Generate the new text for the progress bar
+                new_text = generate_progress_text(
+                    "Downloading", 
+                    percent, 
+                    d.get('_speed_str'), 
+                    d.get('_eta_str'), 
+                    format_elapsed(time.monotonic() - start_time)
                 )
-        except (RuntimeError, Exception):
-            # This can happen if the loop is closing during shutdown.
-            # It's safe to ignore in this context.
-            pass
+
+                # Only send an update if the text has actually changed
+                if new_text != current_progress_text:
+                    current_progress_text = new_text
+                    # Safely schedule the coroutine on the main event loop.
+                    # This is the key to preventing crashes.
+                    asyncio.run_coroutine_threadsafe(
+                        status_msg.edit_text(new_text, parse_mode=ParseMode.MARKDOWN),
+                        loop
+                    )
+        except (RuntimeError, Exception) as e:
+            # This can happen if the loop is closing during shutdown. It's safe to ignore.
+            # We also log other potential errors for debugging.
+            logger.debug(f"Progress hook error: {e}")
 
     ydl_opts = {
         'noplaylist': True, 'quiet': True, 'progress_hooks': [progress_hook],
-        'outtmpl': str(DOWNLOAD_DIR / (f"{custom_filename}.%(ext)s" if custom_filename else "%(title)s.%(ext)s")),
+        'outtmpl': str(DOWNLOAD_DIR / (f"{task['custom_filename']}.%(ext)s" if task['custom_filename'] else "%(title)s.%(ext)s")),
         'retries': 3, 'fragment_retries': 3,
         'http_headers': {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'},
     }
@@ -342,17 +363,18 @@ async def download_media(task: Dict[str, Any], context: Application):
         logger.info("Found cookies.txt, using it for download.")
         ydl_opts['cookiefile'] = str(COOKIE_FILE)
     
-    if format_choice == 'mp3':
+    if task['format_choice'] == 'mp3':
         ydl_opts.update({'format': 'bestaudio/best', 'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '192'}]})
     else:
-        ydl_opts['format'] = f"{quality_id}+bestaudio/best" if quality_id != 'best' else 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best'
+        ydl_opts['format'] = f"{task['quality_id']}+bestaudio/best" if task['quality_id'] != 'best' else 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best'
         ydl_opts.setdefault('postprocessors', []).append({'key': 'FFmpegVideoConvertor', 'preferedformat': 'mp4'})
     
     try:
+        start_time = time.monotonic()
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = await to_thread(ydl.extract_info, url, download=True)
             final_path = Path(ydl.prepare_filename(info))
-            if format_choice == 'mp3' and final_path.suffix != '.mp3':
+            if task['format_choice'] == 'mp3' and final_path.suffix != '.mp3':
                 final_path = final_path.with_suffix('.mp3')
 
         if not final_path or not final_path.exists():
@@ -361,10 +383,10 @@ async def download_media(task: Dict[str, Any], context: Application):
         await status_msg.edit_text(generate_progress_text("Uploading..."), parse_mode=ParseMode.MARKDOWN)
         if final_path.stat().st_size <= TELEGRAM_SAFE_MAX_BYTES:
             with final_path.open("rb") as f:
-                await context.bot.send_document(chat_id, document=f, filename=final_path.name)
+                await application.bot.send_document(chat_id, document=f, filename=final_path.name)
         else:
             link = await upload_file(final_path)
-            await context.bot.send_message(chat_id, f"✅ Upload complete!\n\nLink: {link}" if link else "❌ Upload failed.")
+            await application.bot.send_message(chat_id, f"✅ Upload complete!\n\nLink: {link}" if link else "❌ Upload failed.")
         await status_msg.delete()
     
     except Exception as e:
@@ -372,8 +394,8 @@ async def download_media(task: Dict[str, Any], context: Application):
         logger.exception(f"Error for URL {url}")
         try:
             await status_msg.edit_text(error_message)
-        except Exception:
-            await context.bot.send_message(chat_id, error_message)
+        except TelegramError: # The original message might be deleted
+            await application.bot.send_message(chat_id, error_message)
     finally:
         if final_path and final_path.exists():
             await to_thread(final_path.unlink)
@@ -384,8 +406,6 @@ def main():
     """Initializes and runs the bot."""
     load_queue_from_disk()
     
-    # NOTE: To use conversation_timeout, you must install the job queue dependency:
-    # pip install "python-telegram-bot[job-queue]"
     persistence = PicklePersistence(filepath=PERSISTENCE_FILE)
     application = Application.builder().token(BOT_TOKEN).persistence(persistence).build()
     
@@ -398,7 +418,7 @@ def main():
             GET_NEW_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_new_name_handler)],
         },
         fallbacks=[CommandHandler("cancel", cancel_handler)],
-        conversation_timeout=600 # This will only work if job-queue is installed
+        conversation_timeout=600
     )
     
     application.add_handler(CommandHandler("start", start_handler))
