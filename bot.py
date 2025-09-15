@@ -1,286 +1,586 @@
-import logging
+#!/usr/bin/env python3
+"""
+Ultimate Media Downloader Bot - Final Version
+Features:
+- yt-dlp for downloads
+- aiohttp for non-blocking uploads (0x0.st & gofile)
+- progress updates (rate-limited)
+- optional rename (user types new name or /skip)
+- video quality selection
+- per-user queue with JSON persistence (queue.json)
+- global concurrency limit (Semaphore)
+- PicklePersistence for conversation/user_data persistence
+"""
+
 import os
 import re
-import requests
-import asyncio
+import json
 import time
+import asyncio
+import logging
 import yt_dlp
-from functools import wraps
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.constants import ParseMode
+import aiohttp
+from pathlib import Path
+from functools import partial
+from typing import Dict, Any, List, Optional
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ParseMode, Update
 from telegram.ext import (
-    ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes,
-    ConversationHandler, CallbackQueryHandler
+    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
+    ConversationHandler, ContextTypes, filters, PicklePersistence
 )
 
-# --- ⚙️ CONFIGURATION & CONSTANTS ⚙️ ---
+# ---------------- CONFIG ----------------
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+if not BOT_TOKEN:
+    raise RuntimeError("Set BOT_TOKEN environment variable")
+
+DOWNLOAD_DIR = Path("downloads")
+DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+QUEUE_FILE = Path("queue.json")           # persistent queue store
+PERSISTENCE_FILE = "bot_persistence.pkl"  # PicklePersistence file for user_data
+
+SUPPORTED_SITES_LINK = "https://github.com/yt-dlp/yt-dlp/blob/master/supportedsites.md"
 CREATOR_NAME = "shadow maniya"
 CONNECT_LINK = "https://www.linkedin.com/in/dhruv-maniya-shadow03"
-WELCOME_IMAGE_URL = "https://i.ibb.co/bMNj87bT/download.jpg"
-MAX_FILE_SIZE_MB = 49.5
 
-# --- ✨ ANIMATIONS & UI ✨ ---
+# Limits
+TELEGRAM_SAFE_MAX_BYTES = 49 * 1024 * 1024  # 49 MB (safe)
+GLOBAL_MAX_CONCURRENT_DOWNLOADS = 3         # semaphore limit
+
+# Spinner frames & UI
 SPINNER_FRAMES = ["⢿", "⣻", "⣽", "⣾", "⣷", "⣯", "⣟", "⡿"]
 
-# --- 💡 CONVERSATION STATES 💡 ---
+# Conversation states
 CHOOSE_FORMAT, CHOOSE_QUALITY, ASK_RENAME, GET_NEW_NAME = range(4)
 
-# --- Bot Setup ---
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+# In-memory queue: user_id -> list[task]
+DOWNLOAD_QUEUE: Dict[str, List[Dict[str, Any]]] = {}
+
+# Global semaphore
+DOWNLOAD_SEMAPHORE = asyncio.Semaphore(GLOBAL_MAX_CONCURRENT_DOWNLOADS)
+
+# Logging
+logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- UI & Helper Functions ---
-def format_time(seconds):
-    minutes, seconds = divmod(int(seconds), 60)
-    return f"{minutes}m {seconds}s" if minutes > 0 else f"{seconds}s"
+# ---------------- Utilities ----------------
+def sanitize_filename(name: str) -> str:
+    """Replace unsafe file characters and trim whitespace."""
+    if not name:
+        return ""
+    return re.sub(r'[\\/*?:"<>|]', "_", name).strip()
 
-def generate_progress_bar(percent):
-    filled_length = int(10 * percent // 100)
-    return '█' * filled_length + '░' * (10 - filled_length)
+def format_elapsed(seconds: float) -> str:
+    s = int(seconds)
+    m, s = divmod(s, 60)
+    h, m = divmod(m, 60)
+    if h:
+        return f"{h}h {m}m {s}s"
+    if m:
+        return f"{m}m {s}s"
+    return f"{s}s"
 
-async def update_status_message(context, message, status_text, start_time, percent=0, speed="", eta=""):
-    now = time.monotonic()
-    if now - context.bot_data.get('last_update_time', 0) < 1.5 and percent < 99: return
-    elapsed_time = format_time(now - start_time)
-    spinner = SPINNER_FRAMES[int(now * 10) % len(SPINNER_FRAMES)]
+def generate_progress_text(status_text: str, percent: Optional[float] = None,
+                           speed: Optional[str] = None, eta: Optional[str] = None,
+                           elapsed: Optional[str] = None) -> str:
+    spinner = SPINNER_FRAMES[int(time.time() * 10) % len(SPINNER_FRAMES)]
     text = f"`{spinner}` *{status_text}*\n\n"
-    if percent > 0:
-        bar = generate_progress_bar(percent)
-        text += f"`[{bar}] {percent:.1f}%`\n`Speed:` {speed}\n`ETA:` {eta}\n"
-    text += f"`Time:` {elapsed_time}"
+    if percent is not None:
+        filled = int(10 * (percent / 100))
+        bar = "█" * filled + "░" * (10 - filled)
+        text += f"`[{bar}] {percent:.1f}%`\n"
+    if speed:
+        text += f"`Speed:` {speed}\n"
+    if eta:
+        text += f"`ETA:` {eta}\n"
+    if elapsed:
+        text += f"`Time:` {elapsed}\n"
+    return text
+
+async def to_thread(func, *args, **kwargs):
+    """Convenience wrapper for running blocking functions in a thread."""
+    return await asyncio.to_thread(partial(func, *args, **kwargs))
+
+# ---------------- Queue Persistence ----------------
+def save_queue_to_disk():
     try:
-        await context.bot.edit_message_text(text=text, chat_id=message.chat_id,
-                                            message_id=message.message_id, parse_mode=ParseMode.MARKDOWN)
-        context.bot_data['last_update_time'] = now
-    except: pass
+        # Convert keys to str for JSON safety (user_id ints -> strings)
+        serializable = {str(k): v for k, v in DOWNLOAD_QUEUE.items()}
+        with QUEUE_FILE.open("w", encoding="utf-8") as f:
+            json.dump(serializable, f, ensure_ascii=False, indent=2)
+    except Exception:
+        logger.exception("Failed to save queue to disk")
 
-async def upload_to_0x0(file_path):
+def load_queue_from_disk():
+    global DOWNLOAD_QUEUE
+    if not QUEUE_FILE.exists():
+        return
     try:
-        with open(file_path, 'rb') as f:
-            response = requests.post('https://0x0.st', files={'file': f}, timeout=60)
-        return response.text.strip() if response.status_code == 200 else None
-    except: return None
+        with QUEUE_FILE.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        # restore keys as str (we use str user_id consistently)
+        DOWNLOAD_QUEUE = {str(k): v for k, v in data.items()}
+        logger.info("Loaded queue from disk")
+    except Exception:
+        logger.exception("Failed to load queue from disk")
 
-async def upload_to_gofile(file_path):
+# ---------------- Upload helpers (aiohttp) ----------------
+async def upload_to_gofile(file_path: str) -> Optional[str]:
+    url = "https://store1.gofile.io/uploadFile"
     try:
-        server = requests.get('https://api.gofile.io/getServer', timeout=10).json().get('data', {}).get('server')
-        if not server: return None
-        with open(file_path, 'rb') as f:
-            response = requests.post(f'https://{server}.gofile.io/uploadFile', files={'file': f}, timeout=60).json()
-        return response.get('data', {}).get('downloadPage')
-    except: return None
+        async with aiohttp.ClientSession() as session:
+            with open(file_path, "rb") as f:
+                data = aiohttp.FormData()
+                data.add_field("file", f, filename=Path(file_path).name)
+                async with session.post(url, data=data, timeout=300) as resp:
+                    resp_json = await resp.json()
+                    return resp_json.get("data", {}).get("downloadPage")
+    except Exception:
+        logger.exception("Gofile upload failed")
+        return None
 
-# --- Main Download Logic ---
-async def download_media(chat_id, url, format_choice, quality_id, custom_filename, context: ContextTypes.DEFAULT_TYPE):
-    start_time = time.monotonic()
-    status_message = await context.bot.send_message(chat_id=chat_id, text="`⢿` *Initializing...*")
-
-    def progress_hook(d):
-        if d['status'] == 'downloading':
-            percent = d.get('_percent_str', '0%').replace('%','').strip()
-            speed = d.get('_speed_str', 'N/A').strip()
-            eta = d.get('_eta_str', 'N/A').strip()
-            asyncio.ensure_future(update_status_message(
-                context, status_message, "Downloading", start_time, float(percent), speed, eta))
-    
-    ydl_opts = {'noplaylist': True, 'logger': logger, 'progress_hooks': [progress_hook],
-                'outtmpl': f"{custom_filename}.%(ext)s" if custom_filename else '%(title)s.%(ext)s'}
-
-    if format_choice == 'mp3':
-        ydl_opts['format'] = 'bestaudio/best'
-        ydl_opts['postprocessors'] = [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '320'}]
-    else:
-        ydl_opts['format'] = f'{quality_id}+bestaudio/best'
-        ydl_opts['postprocessors'] = [{'key': 'FFmpegVideoConvertor', 'preferedformat': 'mp4'}]
-
-    file_path = None
+async def upload_to_0x0(file_path: str) -> Optional[str]:
+    url = "https://0x0.st"
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info_dict = ydl.extract_info(url, download=True)
-            original_file_path = ydl.prepare_filename(info_dict)
-            file_path = os.path.splitext(original_file_path)[0] + f'.{format_choice}'
-            if not os.path.exists(file_path) and os.path.exists(original_file_path):
-                os.rename(original_file_path, file_path)
+        async with aiohttp.ClientSession() as session:
+            with open(file_path, "rb") as f:
+                data = aiohttp.FormData()
+                data.add_field("file", f, filename=Path(file_path).name)
+                async with session.post(url, data=data, timeout=120) as resp:
+                    text = await resp.text()
+                    if resp.status == 200 and text.strip():
+                        return text.strip()
+                    return None
+    except Exception:
+        logger.exception("0x0.st upload failed")
+        return None
 
-        await update_status_message(context, status_message, "Processing File", start_time, percent=100)
-        file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
-        total_time = format_time(time.monotonic() - start_time)
-        
-        # --- LOGIC FIX STARTS HERE ---
-        if file_size_mb < MAX_FILE_SIZE_MB:
-            await update_status_message(context, status_message, "Uploading to Telegram", start_time, percent=100)
-            if format_choice == 'mp3':
-                with open(file_path, 'rb') as f: await context.bot.send_audio(chat_id=chat_id, audio=f, title=info_dict.get('title'))
-            else:
-                with open(file_path, 'rb') as f: await context.bot.send_video(chat_id=chat_id, video=f, caption=info_dict.get('title'))
-            
-            # For small files, delete the status message and send a NEW summary message
-            await status_message.delete()
-            final_summary = (f"✅ **Task Complete!**\n\n"
-                             f"📄 `{os.path.basename(file_path)}`\n"
-                             f"📦 `Size: {file_size_mb:.2f} MB`\n"
-                             f"⏱️ `Total Time: {total_time}`\n\n"
-                             f"Connect with *{CREATOR_NAME}* here: {CONNECT_LINK}")
-            await context.bot.send_message(chat_id=chat_id, text=final_summary, parse_mode=ParseMode.MARKDOWN)
+# ---------------- Queue operations ----------------
+async def process_queue_for_user(user_id: str, app_context: ContextTypes.DEFAULT_TYPE):
+    """Process queued downloads for a user sequentially. Uses global semaphore."""
+    # Guard: ensure user_id in DOWNLOAD_QUEUE
+    while DOWNLOAD_QUEUE.get(user_id):
+        task = DOWNLOAD_QUEUE[user_id].pop(0)
+        save_queue_to_disk()
+        chat_id = task["chat_id"]
+        url = task["url"]
+        format_choice = task["format_choice"]
+        quality_id = task.get("quality_id", "best")
+        custom_filename = task.get("custom_filename")
+        try:
+            async with DOWNLOAD_SEMAPHORE:
+                logger.info(f"Starting download for user {user_id}: {url}")
+                await download_media(chat_id, url, format_choice, quality_id, custom_filename, app_context)
+        except Exception:
+            logger.exception("Error while processing queued task")
+        # small yield to the loop
+        await asyncio.sleep(0.5)
 
-        else:
-            await update_status_message(context, status_message, "Uploading to Cloud Host", start_time, percent=100)
-            download_link = await upload_to_0x0(file_path) or await upload_to_gofile(file_path)
-            
-            if download_link:
-                # For large files, build the summary and EDIT the status message with the link
-                final_summary = (f"✅ **Task Complete!**\n\n"
-                                 f"File was too large for Telegram.\n"
-                                 f"📦 `Size: {file_size_mb:.2f} MB`\n"
-                                 f"⏱️ `Total Time: {total_time}`\n\n"
-                                 f"🔗 **Download Link:** {download_link}")
-                await status_message.edit_text(text=final_summary, parse_mode=ParseMode.MARKDOWN)
-            else:
-                await status_message.edit_text(text="❌ Sorry, the upload to both primary and backup hosts failed.", parse_mode=ParseMode.MARKDOWN)
-        # --- LOGIC FIX ENDS HERE ---
+async def queue_download(chat_id: int, user_id: int, url: str,
+                         format_choice: str, quality_id: str,
+                         custom_filename: Optional[str], app_context: ContextTypes.DEFAULT_TYPE):
+    """Add task to queue and start processing if idle."""
+    uid = str(user_id)
+    DOWNLOAD_QUEUE.setdefault(uid, []).append({
+        "chat_id": chat_id,
+        "url": url,
+        "format_choice": format_choice,
+        "quality_id": quality_id,
+        "custom_filename": custom_filename
+    })
+    save_queue_to_disk()
+    # If this is the only task, spawn a background task to process queue
+    if len(DOWNLOAD_QUEUE[uid]) == 1:
+        # start background task without awaiting
+        asyncio.create_task(process_queue_for_user(uid, app_context))
 
-    except Exception as e:
-        await status_message.edit_text(f"❌ **An error occurred**\n\n`{str(e)}`", parse_mode=ParseMode.MARKDOWN)
-    finally:
-        if file_path and os.path.exists(file_path):
-            os.remove(file_path)
+# ---------------- Handlers ----------------
+async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_name = update.effective_user.first_name or "there"
+    await update.message.reply_text(
+        f"👋 Hello {user_name}!\n"
+        "Send a supported media link (YouTube, TikTok, etc.) to begin.\n\n"
+        "Shortcuts:\n"
+        "/audio <url> - Direct audio\n"
+        "/video <url> - Direct video\n"
+        "/sites - Supported sites\n"
+        "/cancel - Cancel your queued downloads"
+    )
 
-# --- Conversation Handlers ---
+async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "How to use:\n1. Send a link.\n2. Choose format & quality.\n3. Rename or /skip.\n\n"
+        "Shortcuts:\n/audio <url>\n/video <url>\n/sites\n/cancel"
+    )
+
+async def sites_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(f"Supported sites (via yt-dlp): {SUPPORTED_SITES_LINK}")
+
+# Handle link: fetch info and present format buttons
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    #... (This function is unchanged)
-    url = update.message.text
-    pre_check_message = await update.message.reply_text("🔍 Checking link...")
+    msg = update.message
+    url = msg.text.strip()
+    status_msg = await msg.reply_text("🔍 Checking link and fetching metadata...")
     try:
+        loop = asyncio.get_event_loop()
         with yt_dlp.YoutubeDL({'noplaylist': True, 'quiet': True}) as ydl:
-            info_dict = ydl.extract_info(url, download=False)
-        context.user_data.update({'url': url, 'info_dict': info_dict})
-        keyboard = [[InlineKeyboardButton("🎬 Video (MP4)", callback_data='mp4'),
-                     InlineKeyboardButton("🎵 Audio (MP3)", callback_data='mp3')]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        duration_str = time.strftime('%H:%M:%S', time.gmtime(info_dict.get('duration', 0)))
-        preview_text = (f"**Title:** {info_dict.get('title')}\n"
-                        f"**Duration:** {duration_str}\n\n"
-                        "Please choose your desired format:")
-        await pre_check_message.edit_text(text=preview_text, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN)
+            info = await loop.run_in_executor(None, lambda: ydl.extract_info(url, download=False))
+        context.user_data['url'] = url
+        context.user_data['info'] = info
+
+        # Prepare preview
+        title = info.get('title', 'Unknown title')
+        uploader = info.get('uploader', 'Unknown uploader')
+        duration = time.strftime('%H:%M:%S', time.gmtime(info.get('duration', 0)))
+        thumbnail = info.get('thumbnail')
+
+        preview = f"*{title}*\n_by:_ {uploader}\nDuration: `{duration}`\n\nChoose format:"
+        buttons = [
+            [InlineKeyboardButton("🎬 Video (MP4)", callback_data='format|mp4'),
+             InlineKeyboardButton("🎵 Audio (MP3)", callback_data='format|mp3')]
+        ]
+        reply_markup = InlineKeyboardMarkup(buttons)
+
+        await status_msg.delete()
+        if thumbnail:
+            await msg.reply_photo(photo=thumbnail, caption=preview, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
+        else:
+            await msg.reply_markdown(preview, reply_markup=reply_markup)
         return CHOOSE_FORMAT
-    except:
-        await pre_check_message.edit_text(f"❌ Could not process the link.")
+    except Exception as e:
+        logger.exception("Error in handle_link")
+        await status_msg.edit_text("❌ Could not process the link. Maybe it's private or unsupported.")
         return ConversationHandler.END
 
+# When user picks format (mp3 or mp4)
 async def choose_format_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    #... (This function is unchanged)
     query = update.callback_query
     await query.answer()
-    context.user_data['format_choice'] = query.data
-    info_dict = context.user_data.get('info_dict')
-    if query.data == 'mp3':
-        context.user_data['quality_id'] = 'bestaudio'
-        keyboard = [[InlineKeyboardButton("✅ Keep Original Title", callback_data='keep'),
-                     InlineKeyboardButton("✏️ Rename File", callback_data='rename')]]
-        await query.edit_message_text(text=f"Default name: `{info_dict.get('title')}`. Do you want to rename it?", 
-                                      reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
-        return ASK_RENAME
-    
-    formats, quality_buttons, unique_qualities = info_dict.get('formats', []), [], {}
-    for f in formats:
-        if f.get('vcodec') != 'none' and f.get('acodec') == 'none':
-            height, format_id = f.get('height'), f.get('format_id')
-            if height and height not in unique_qualities: unique_qualities[height] = format_id
-    quality_buttons.append([InlineKeyboardButton("Best Available (up to 720p)", callback_data="best|720")])
-    for height, format_id in sorted(unique_qualities.items(), reverse=True):
-        label = f"{height}p"
-        if height >= 1080: label += " (HD)"
-        if height >= 2160: label += " (4K)"
-        quality_buttons.append([InlineKeyboardButton(label, callback_data=f"{format_id}|{height}")])
-    
-    await query.edit_message_text("Please choose a video quality:", reply_markup=InlineKeyboardMarkup(quality_buttons))
-    return CHOOSE_QUALITY
+    payload = query.data  # e.g., 'format|mp4' or 'format|mp3'
+    _, fmt = payload.split("|", 1)
+    context.user_data['format_choice'] = fmt
 
+    if fmt == 'mp3':
+        # skip quality selection — audio uses best audio
+        context.user_data['quality_id'] = 'bestaudio'
+        # ask rename or keep
+        buttons = [[InlineKeyboardButton("✅ Keep Default Name", callback_data='rename_choice|keep'),
+                    InlineKeyboardButton("✏️ Rename File", callback_data='rename_choice|rename')]]
+        text = f"Default filename: `{sanitize_filename(context.user_data.get('info', {}).get('title','file'))}`\nDo you want to rename it?"
+        try:
+            await query.edit_message_caption(caption=text, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(buttons))
+        except Exception:
+            await query.edit_message_text(text=text, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(buttons))
+        return ASK_RENAME
+    else:
+        # Build quality list from info['formats']
+        info = context.user_data.get('info', {})
+        formats = info.get('formats', [])
+        # Filter formats that have video (vcodec != none) and audio (acodec != none) or simply prefer mp4
+        candidates = []
+        seen_heights = set()
+        for f in formats:
+            vcodec = f.get('vcodec')
+            acodec = f.get('acodec')
+            height = f.get('height') or 0
+            format_id = f.get('format_id')
+            ext = f.get('ext')
+            # prefer formats that contain both video & audio; but if not available include video-only
+            if vcodec and vcodec != 'none':
+                # choose only one format per resolution to avoid duplicates
+                if height not in seen_heights:
+                    seen_heights.add(height)
+                    filesize = f.get('filesize') or f.get('filesize_approx') or 0
+                    candidates.append({
+                        'height': height,
+                        'format_id': format_id,
+                        'ext': ext,
+                        'filesize': filesize
+                    })
+        # Fallback if no candidates
+        if not candidates:
+            buttons = [[InlineKeyboardButton("Best available", callback_data='quality|best')]]
+            await query.edit_message_text("No quality list available — proceeding with Best available.", reply_markup=InlineKeyboardMarkup(buttons))
+            return CHOOSE_QUALITY
+
+        # Create buttons sorted by height desc
+        buttons = []
+        # Add Best option
+        buttons.append([InlineKeyboardButton("Best available", callback_data='quality|best')])
+        for c in sorted(candidates, key=lambda x: (x['height'] or 0), reverse=True):
+            label = f"{c['height']}p" if c['height'] else "Unknown"
+            if c['filesize']:
+                label += f" (~{c['filesize'] / (1024*1024):.1f}MB)"
+            buttons.append([InlineKeyboardButton(label, callback_data=f"quality|{c['format_id']}")])
+        await query.edit_message_text("Choose a video quality:", reply_markup=InlineKeyboardMarkup(buttons))
+        return CHOOSE_QUALITY
+
+# Quality chosen handler
 async def choose_quality_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    #... (This function is unchanged)
     query = update.callback_query
     await query.answer()
-    context.user_data['quality_id'] = query.data.split('|')[0]
-    info_dict = context.user_data.get('info_dict')
-    keyboard = [[InlineKeyboardButton("✅ Keep Original Title", callback_data='keep'),
-                 InlineKeyboardButton("✏️ Rename File", callback_data='rename')]]
-    await query.edit_message_text(text=f"Default name: `{info_dict.get('title')}`. Do you want to rename it?", 
-                                  reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
+    payload = query.data  # 'quality|best' or 'quality|<format_id>'
+    _, quality = payload.split("|", 1)
+    context.user_data['quality_id'] = quality
+    # ask rename or keep
+    buttons = [[InlineKeyboardButton("✅ Keep Default Name", callback_data='rename_choice|keep'),
+                InlineKeyboardButton("✏️ Rename File", callback_data='rename_choice|rename')]]
+    text = f"Default filename: `{sanitize_filename(context.user_data.get('info', {}).get('title','file'))}`\nDo you want to rename it?"
+    try:
+        await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(buttons))
+    except Exception:
+        await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(buttons))
     return ASK_RENAME
 
-async def ask_rename_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    #... (This function is unchanged)
+# Rename choice (inline)
+async def ask_rename_inline_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if query.data == 'keep':
-        await query.edit_message_text("Perfect! Starting download.")
-        await download_media(query.message.chat_id, context.user_data['url'], context.user_data['format_choice'], 
-                             context.user_data['quality_id'], None, context)
+    _, choice = query.data.split("|", 1)
+    if choice == 'keep':
+        context.user_data['custom_filename'] = None
+        await query.edit_message_text("Using default filename. Queuing download...")
+        await queue_download(query.message.chat_id, query.from_user.id,
+                             context.user_data['url'], context.user_data['format_choice'],
+                             context.user_data.get('quality_id', 'best'), None, context)
         return ConversationHandler.END
-    else: # rename
-        await query.edit_message_text("Okay, please send me the new name for the file.")
+    else:
+        await query.edit_message_text("Send the new filename (no extension). Or type /skip to keep default.")
         return GET_NEW_NAME
 
-async def get_new_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    #... (This function is unchanged)
-    custom_filename = re.sub(r'[\\/*?:"<>|]', "", update.message.text.strip())
-    await update.message.reply_text(f"Got it! I'll name the file: `{custom_filename}`", parse_mode=ParseMode.MARKDOWN)
-    await download_media(update.message.chat_id, context.user_data['url'], context.user_data['format_choice'], 
-                         context.user_data['quality_id'], custom_filename, context)
+# Receive a typed filename
+async def get_new_name_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    raw = update.message.text.strip()
+    sanitized = sanitize_filename(raw)
+    if not sanitized:
+        await update.message.reply_text("Invalid filename. Send another name or /skip.")
+        return GET_NEW_NAME
+    context.user_data['custom_filename'] = sanitized
+    await update.message.reply_text(f"Filename set to `{sanitized}`", parse_mode=ParseMode.MARKDOWN)
+    # queue download
+    await queue_download(update.message.chat_id, update.effective_user.id,
+                         context.user_data['url'], context.user_data['format_choice'],
+                         context.user_data.get('quality_id', 'best'), sanitized, context)
     return ConversationHandler.END
 
-# --- Standard Commands (start, help, cancel) ---
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    #... (This function is unchanged)
-    user_name = update.effective_user.first_name
-    welcome_caption = (f"👋 Hello, {user_name}!\n\nI am the **Ultimate Media Downloader**, created by *{CREATOR_NAME}*.\n\n"
-                       "Send me a link from YouTube, TikTok, and more to begin.")
-    await context.bot.send_photo(chat_id=update.effective_chat.id, photo=WELCOME_IMAGE_URL, caption=welcome_caption,
-                                 parse_mode=ParseMode.MARKDOWN)
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    #... (This function is unchanged)
-    help_text = ("**How to use this bot:**\n\n"
-                 "1. Send a link from a supported site.\n"
-                 "2. Choose your format (Video/Audio) and quality.\n"
-                 "3. Decide if you want to rename the file.\n"
-                 "4. I'll download it, showing a live progress bar. Large files will be sent as a cloud link.\n\n"
-                 "Use /cancel to stop any operation.")
-    await update.message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN)
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    #... (This function is unchanged)
-    if context.user_data: context.user_data.clear()
-    await update.message.reply_text("Operation cancelled.")
+# Skip rename
+async def skip_rename_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['custom_filename'] = None
+    await update.message.reply_text("Keeping default filename.")
+    await queue_download(update.message.chat_id, update.effective_user.id,
+                         context.user_data['url'], context.user_data['format_choice'],
+                         context.user_data.get('quality_id', 'best'), None, context)
     return ConversationHandler.END
 
-# --- Main Bot Execution ---
+# Shortcuts
+async def audio_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        return await update.message.reply_text("Usage: /audio <url>")
+    url = context.args[0]
+    await queue_download(update.effective_chat.id, update.effective_user.id, url, 'mp3', 'bestaudio', None, context)
+    await update.message.reply_text("🎵 Audio queued.")
+    return ConversationHandler.END
+
+async def video_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        return await update.message.reply_text("Usage: /video <url>")
+    url = context.args[0]
+    await queue_download(update.effective_chat.id, update.effective_user.id, url, 'mp4', 'best', None, context)
+    await update.message.reply_text("🎬 Video queued.")
+    return ConversationHandler.END
+
+# Cancel handler - clears user's queue
+async def cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = str(update.effective_user.id)
+    if DOWNLOAD_QUEUE.get(uid):
+        DOWNLOAD_QUEUE[uid].clear()
+        save_queue_to_disk()
+        await update.message.reply_text("🛑 Your queued downloads were cancelled.")
+    else:
+        await update.message.reply_text("You have no queued downloads.")
+    return ConversationHandler.END
+
+# ---------------- Core download logic ----------------
+async def download_media(chat_id: int, url: str, format_choice: str,
+                         quality_id: str, custom_filename: Optional[str],
+                         context: ContextTypes.DEFAULT_TYPE):
+    """Download via yt-dlp (in executor), show progress, upload to Telegram or cloud."""
+    # send initial status message
+    status_msg = await context.bot.send_message(chat_id=chat_id, text=generate_progress_text("Initializing..."), parse_mode=ParseMode.MARKDOWN)
+    start_time = time.monotonic()
+    last_update_ts = 0
+
+    # progress hook runs in thread, schedule edits on event loop
+    def progress_hook(d):
+        nonlocal last_update_ts
+        try:
+            status = d.get('status')
+            now = time.time()
+            # rate-limit updates to avoid flooding
+            if status == 'downloading' and now - last_update_ts >= 2:
+                last_update_ts = now
+                percent_str = d.get('_percent_str', '0%').replace('%', '').strip()
+                try:
+                    percent = float(percent_str)
+                except Exception:
+                    percent = 0.0
+                speed = d.get('_speed_str', '')
+                eta = d.get('_eta_str', '')
+                elapsed = format_elapsed(time.monotonic() - start_time)
+                text = generate_progress_text("Downloading", percent=percent, speed=speed, eta=eta, elapsed=elapsed)
+                loop = asyncio.get_event_loop()
+                asyncio.run_coroutine_threadsafe(status_msg.edit_text(text, parse_mode=ParseMode.MARKDOWN), loop)
+            elif status == 'finished':
+                loop = asyncio.get_event_loop()
+                text = generate_progress_text("Download finished. Processing...")
+                asyncio.run_coroutine_threadsafe(status_msg.edit_text(text, parse_mode=ParseMode.MARKDOWN), loop)
+        except Exception:
+            logger.exception("progress_hook error")
+
+    # build yt-dlp options
+    def build_opts():
+        opts = {
+            'noplaylist': True,
+            'quiet': True,
+            'progress_hooks': [progress_hook],
+            'outtmpl': str(DOWNLOAD_DIR / "%(title)s.%(ext)s"),
+            'retries': 1,
+        }
+        if format_choice == 'mp3':
+            opts['format'] = 'bestaudio/best'
+            opts['postprocessors'] = [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': '192',
+            }]
+        else:
+            if quality_id and quality_id != 'best':
+                opts['format'] = f"{quality_id}+bestaudio/best"
+            else:
+                opts['format'] = "best"
+            opts['postprocessors'] = [{'key': 'FFmpegVideoConvertor', 'preferedformat': 'mp4'}]
+        return opts
+
+    final_path = None
+    try:
+        loop = asyncio.get_event_loop()
+        ydl_opts = build_opts()
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = await loop.run_in_executor(None, lambda: ydl.extract_info(url, download=True))
+            original_path = Path(ydl.prepare_filename(info))
+            # extension handling
+            if format_choice == 'mp3':
+                original_path = original_path.with_suffix('.mp3')
+        final_path = original_path
+
+        # rename if requested (use to_thread)
+        if custom_filename:
+            ext = final_path.suffix or ('.mp3' if format_choice == 'mp3' else '')
+            new_path = DOWNLOAD_DIR / f"{sanitize_filename(custom_filename)}{ext}"
+            await to_thread(final_path.replace, new_path)
+            final_path = new_path
+
+        # Upload phase
+        elapsed = format_elapsed(time.monotonic() - start_time)
+        await status_msg.edit_text(generate_progress_text("Uploading", percent=100, elapsed=elapsed), parse_mode=ParseMode.MARKDOWN)
+
+        # get file size using to_thread
+        stat = await to_thread(final_path.stat)
+        size_bytes = stat.st_size
+
+        # if small enough -> upload to Telegram, else upload cloud
+        if size_bytes <= TELEGRAM_SAFE_MAX_BYTES:
+            try:
+                async with final_path.open("rb") as fh:
+                    await context.bot.send_document(chat_id=chat_id, document=fh, filename=final_path.name)
+                await status_msg.delete()
+                summary = (f"✅ **Task Complete!**\n\n"
+                           f"📄 `{final_path.name}`\n"
+                           f"📦 `{size_bytes/(1024*1024):.2f} MB`\n"
+                           f"⏱️ `{elapsed}`\n\n"
+                           f"Connect with *{CREATOR_NAME}*: {CONNECT_LINK}")
+                await context.bot.send_message(chat_id=chat_id, text=summary, parse_mode=ParseMode.MARKDOWN)
+            except Exception:
+                logger.exception("Telegram upload failed, falling back to cloud")
+                await context.bot.send_message(chat_id=chat_id, text="⚠️ Telegram upload failed, uploading to cloud...")
+                link = await upload_to_0x0(str(final_path)) or await upload_to_gofile(str(final_path))
+                if link:
+                    await context.bot.send_message(chat_id=chat_id, text=f"🔗 Download link: {link}")
+                else:
+                    await context.bot.send_message(chat_id=chat_id, text="❌ Upload to cloud failed.")
+                await status_msg.delete()
+        else:
+            # too large for safe telegram upload
+            await context.bot.send_message(chat_id=chat_id, text="⚠️ File too large for Telegram. Uploading to cloud...")
+            link = await upload_to_0x0(str(final_path)) or await upload_to_gofile(str(final_path))
+            if link:
+                await context.bot.send_message(chat_id=chat_id, text=f"🔗 Download link: {link}")
+            else:
+                await context.bot.send_message(chat_id=chat_id, text="❌ Upload to cloud failed.")
+            await status_msg.delete()
+
+    except Exception as e:
+        logger.exception("download_media error")
+        try:
+            await status_msg.edit_text(f"❌ Error: {str(e)[:300]}")
+        except Exception:
+            pass
+    finally:
+        # Cleanup downloaded file
+        try:
+            if final_path and final_path.exists():
+                await to_thread(final_path.unlink)
+        except Exception:
+            logger.exception("Failed to remove temp file")
+
+# ---------------- Application bootstrap ----------------
 def main():
-    #... (This function is unchanged)
-    if not BOT_TOKEN:
-        print("FATAL ERROR: BOT_TOKEN environment variable not found.")
-        return
-    
-    application = ApplicationBuilder().token(BOT_TOKEN).connect_timeout(30).read_timeout(30).write_timeout(30).build()
-    
+    # load persistent queue
+    load_queue_from_disk()
+
+    # PicklePersistence for user_data and conversation_data
+    persistence = PicklePersistence(filepath=PERSISTENCE_FILE)
+    app = Application.builder().token(BOT_TOKEN).persistence(persistence).build()
+
+    # Conversation handler for link flow
     conv_handler = ConversationHandler(
         entry_points=[MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link)],
         states={
-            CHOOSE_FORMAT: [CallbackQueryHandler(choose_format_callback)],
-            CHOOSE_QUALITY: [CallbackQueryHandler(choose_quality_callback)],
-            ASK_RENAME: [CallbackQueryHandler(ask_rename_callback)],
-            GET_NEW_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_new_name)],
+            CHOOSE_FORMAT: [CallbackQueryHandler(choose_format_callback, pattern=r"^format\|")],
+            CHOOSE_QUALITY: [CallbackQueryHandler(choose_quality_callback, pattern=r"^quality\|")],
+            ASK_RENAME: [CallbackQueryHandler(ask_rename_inline_callback, pattern=r"^rename_choice\|")],
+            GET_NEW_NAME: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, get_new_name_handler),
+                CommandHandler("skip", skip_rename_handler)
+            ],
         },
-        fallbacks=[CommandHandler('cancel', cancel)],
+        fallbacks=[CommandHandler("cancel", cancel_handler)],
         conversation_timeout=600
     )
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(conv_handler)
-    
-    print("🚀 Ultimate Media Downloader is up and running!")
-    application.run_polling()
 
-if __name__ == '__main__':
+    # Add handlers
+    app.add_handler(CommandHandler("start", start_handler))
+    app.add_handler(CommandHandler("help", help_handler))
+    app.add_handler(CommandHandler("sites", sites_handler))
+    app.add_handler(CommandHandler("audio", audio_command))
+    app.add_handler(CommandHandler("video", video_command))
+    app.add_handler(CommandHandler("cancel", cancel_handler))
+    app.add_handler(conv_handler)
+
+    # On startup: if queue has pending tasks, spawn processing tasks
+    async def startup_tasks(app):
+        # start processing pending queues
+        for user_id in list(DOWNLOAD_QUEUE.keys()):
+            if DOWNLOAD_QUEUE.get(user_id):
+                # spawn background tasks to process each user's queue
+                asyncio.create_task(process_queue_for_user(user_id, app.bot))
+        logger.info("Startup tasks scheduled (if any).")
+
+    app.post_init = startup_tasks
+
+    logger.info("🚀 Starting Ultimate Media Downloader Bot")
+    app.run_polling()
+
+if __name__ == "__main__":
     main()
