@@ -23,7 +23,8 @@ import aiohttp
 from pathlib import Path
 from functools import partial
 from typing import Dict, Any, List, Optional
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ParseMode, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.constants import ParseMode
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
     ConversationHandler, ContextTypes, filters, PicklePersistence
@@ -584,3 +585,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
