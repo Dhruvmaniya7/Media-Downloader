@@ -18,6 +18,7 @@ import json
 import time
 import asyncio
 import logging
+import shutil
 import yt_dlp
 import aiohttp
 from pathlib import Path
@@ -234,25 +235,19 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     
     info = None
     try:
-        # Try first without cookies for speed
         ydl_opts = {'quiet': True, 'noplaylist': True, 'skip_download': True}
+        if COOKIE_FILE.exists(): ydl_opts['cookiefile'] = str(COOKIE_FILE)
+        
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = await to_thread(ydl.extract_info, url, download=False)
+
     except Exception as e:
-        if "sign in" in str(e).lower() and COOKIE_FILE.exists():
-            logger.info("Initial check failed, retrying with cookies...")
-            try:
-                ydl_opts_cookie = {'quiet': True, 'noplaylist': True, 'skip_download': True, 'cookiefile': str(COOKIE_FILE)}
-                with yt_dlp.YoutubeDL(ydl_opts_cookie) as ydl:
-                    info = await to_thread(ydl.extract_info, url, download=False)
-            except Exception as e_cookie:
-                logger.error(f"Failed to handle link {url} even with cookies: {e_cookie}")
-                await status_msg.edit_text("❌ Error: Could not process link. The cookie file may be invalid.")
-                return ConversationHandler.END
-        else:
-            logger.error(f"Failed to handle link {url}: {e}")
-            await status_msg.edit_text("❌ Error: Could not process link.")
-            return ConversationHandler.END
+        logger.error(f"Failed to handle link {url}: {e}")
+        error_text = "❌ Error: Could not process link."
+        if "confirm you’re not a bot" in str(e):
+             error_text += "\n\nThis video may require a login. The bot's cookie file could be invalid."
+        await status_msg.edit_text(error_text)
+        return ConversationHandler.END
 
     if not info:
         await status_msg.edit_text("❌ Error: Could not retrieve video information.")
@@ -287,7 +282,7 @@ async def choose_format_callback(update: Update, context: ContextTypes.DEFAULT_T
             buttons.append([InlineKeyboardButton(label, callback_data=f"quality|{f['format_id']}")])
 
     if not buttons: buttons.append([InlineKeyboardButton("Best Available", callback_data="quality|best")])
-    buttons.sort(key=lambda b: int(re.search(r'(\d+)p', b[0].text).group(1)) if re.search(r'(\d+)p', b[0].text) else 0, reverse=True)
+    buttons.sort(key=lambda b: int(re.search(r'(\d+)p', b[0].text).group(1)) if re.search(r('(\d+)p', b[0].text) else 0, reverse=True)
     await query.edit_message_text("Please select a video quality:", reply_markup=InlineKeyboardMarkup(buttons))
     return CHOOSE_QUALITY
 
@@ -334,6 +329,7 @@ async def download_media(task: Dict[str, Any], application: Application):
     try:
         start_time = time.monotonic()
         
+        # This dictionary is now corrected and robust
         ydl_opts = {
             'noplaylist': True, 'quiet': True, 'progress_hooks': [progress.get_progress_hook(start_time)],
             'outtmpl': str(DOWNLOAD_DIR / (f"{task['custom_filename']}.%(ext)s" if task['custom_filename'] else "%(title)s.%(ext)s")),
@@ -352,26 +348,27 @@ async def download_media(task: Dict[str, Any], application: Application):
             })
         else: # mp4
             ydl_opts['format'] = f"{task['quality_id']}+bestaudio/best" if task['quality_id'] != 'best' else 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best'
-            # THE TYPO IS FIXED HERE: 'preferedformat' is correct.
+            # THE TYPO IS FIXED HERE: 'preferedformat' (one 'r') is correct.
             ydl_opts.setdefault('postprocessors', []).append({'key': 'FFmpegVideoConvertor', 'preferedformat': 'mp4'})
         
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info_dict = await to_thread(ydl.extract_info, url, download=True)
-            
+
             final_path_str = ydl.prepare_filename(info_dict)
             if not final_path_str:
                 raise FileNotFoundError("Could not determine final file path from yt-dlp.")
             final_path = Path(final_path_str)
 
-            # Adjust for post-processing extension changes
             if task['format_choice'] == 'mp3': final_path = final_path.with_suffix('.mp3')
-            else: final_path = final_path.with_suffix('.mp4')
-
+            elif final_path.suffix != '.mp4': final_path = final_path.with_suffix('.mp4')
 
         if not final_path.exists():
-            await asyncio.sleep(1)
+            await asyncio.sleep(1.5)
             if not final_path.exists():
                 raise FileNotFoundError(f"File not found at expected path: {final_path}")
+        
+        if final_path.stat().st_size < 1024: # Check for junk files
+             raise ValueError(f"Downloaded file is suspiciously small ({final_path.stat().st_size} bytes). Download likely failed.")
 
         await progress.update(generate_progress_text("Uploading..."))
         if final_path.stat().st_size <= TELEGRAM_SAFE_MAX_BYTES:
@@ -385,10 +382,8 @@ async def download_media(task: Dict[str, Any], application: Application):
     except Exception as e:
         error_message = f"❌ Download failed. Error: {str(e)[:200]}"
         logger.exception(f"CRITICAL FAILURE for URL {url}")
-        try:
-            await progress.update(error_message)
-        except TelegramError:
-             await application.bot.send_message(chat_id, error_message)
+        try: await progress.update(error_message)
+        except TelegramError: await application.bot.send_message(chat_id, error_message)
     finally:
         if final_path and final_path.exists():
             await to_thread(final_path.unlink)
@@ -396,6 +391,12 @@ async def download_media(task: Dict[str, Any], application: Application):
 
 # ---------------- Application Bootstrap ----------------
 def main():
+    # Check for FFmpeg on startup
+    if not shutil.which("ffmpeg"):
+        logger.error("FATAL ERROR: FFmpeg is not installed or not in PATH. The bot cannot function without it.")
+        return
+    logger.info("FFmpeg found, proceeding with startup.")
+
     load_queue_from_disk()
     persistence = PicklePersistence(filepath=PERSISTENCE_FILE)
     application = Application.builder().token(BOT_TOKEN).persistence(persistence).build()
