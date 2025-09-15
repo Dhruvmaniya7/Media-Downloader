@@ -45,6 +45,9 @@ SUPPORTED_SITES_LINK = "https://github.com/yt-dlp/yt-dlp/blob/master/supportedsi
 CREATOR_NAME = "shadow maniya"
 CONNECT_LINK = "https://www.linkedin.com/in/dhruv-maniya-shadow03"
 
+# NEW: welcome image
+WELCOME_IMAGE_URL = "https://i.ibb.co/bMNj87bT/download.jpg"
+
 # Limits
 TELEGRAM_SAFE_MAX_BYTES = 49 * 1024 * 1024  # 49 MB (safe)
 GLOBAL_MAX_CONCURRENT_DOWNLOADS = 3         # semaphore limit
@@ -194,21 +197,31 @@ async def queue_download(chat_id: int, user_id: int, url: str,
     # If this is the only task, spawn a background task to process queue
     if len(DOWNLOAD_QUEUE[uid]) == 1:
         # start background task without awaiting
+        # pass the bot (or app_context) so download_media can use context.bot
         asyncio.create_task(process_queue_for_user(uid, app_context))
 
 # ---------------- Handlers ----------------
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_name = update.effective_user.first_name or "there"
-    await update.message.reply_text(
+    caption = (
         f"👋 Hello {user_name}!\n"
         "Send a supported media link (YouTube, TikTok, etc.) to begin.\n\n"
         "Shortcuts:\n"
         "/audio <url> - Direct audio\n"
         "/video <url> - Direct video\n"
         "/sites - Supported sites\n"
-        "/cancel - Cancel your queued downloads"
-        "created by shadow maniya...!"
+        "/cancel - Cancel your queued downloads\n\n"
+        f"created by *{CREATOR_NAME}*.\n\n"
     )
+    # Send welcome image with caption (if available)
+    try:
+        if WELCOME_IMAGE_URL:
+            await update.message.reply_photo(photo=WELCOME_IMAGE_URL, caption=caption, parse_mode=ParseMode.MARKDOWN)
+        else:
+            await update.message.reply_markdown(caption)
+    except Exception:
+        # fallback to plain text if photo fails
+        await update.message.reply_markdown(caption)
 
 async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -461,7 +474,8 @@ async def download_media(chat_id: int, url: str, format_choice: str,
                 opts['format'] = f"{quality_id}+bestaudio/best"
             else:
                 opts['format'] = "best"
-            opts['postprocessors'] = [{'key': 'FFmpegVideoConvertor', 'preferedformat': 'mp4'}]
+            # yt-dlp prefers 'preferredformat' for FFmpegVideoConvertor; keep as widely compatible
+            opts['postprocessors'] = [{'key': 'FFmpegVideoConvertor', 'preferredformat': 'mp4'}]
         return opts
 
     final_path = None
@@ -571,14 +585,15 @@ def main():
     app.add_handler(conv_handler)
 
     # On startup: if queue has pending tasks, spawn processing tasks
-    async def startup_tasks(app):
+    async def startup_tasks(application):
         # start processing pending queues
         for user_id in list(DOWNLOAD_QUEUE.keys()):
             if DOWNLOAD_QUEUE.get(user_id):
                 # spawn background tasks to process each user's queue
-                asyncio.create_task(process_queue_for_user(user_id, app.bot))
+                asyncio.create_task(process_queue_for_user(user_id, application))
         logger.info("Startup tasks scheduled (if any).")
 
+    # attach startup hook
     app.post_init = startup_tasks
 
     logger.info("🚀 Starting Ultimate Media Downloader Bot")
@@ -586,5 +601,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
