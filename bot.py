@@ -232,24 +232,30 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     url = normalize_url(msg.text)
     status_msg = await msg.reply_text("🔍 Analyzing link...")
     
-    # Try first without cookies for speed
-    ydl_opts = {'quiet': True, 'noplaylist': True, 'skip_download': True}
     info = None
     try:
+        # Try first without cookies for speed
+        ydl_opts = {'quiet': True, 'noplaylist': True, 'skip_download': True}
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = await to_thread(ydl.extract_info, url, download=False)
     except Exception as e:
-        # If it fails and requires login, retry with cookies if they exist
         if "sign in" in str(e).lower() and COOKIE_FILE.exists():
             logger.info("Initial check failed, retrying with cookies...")
-            ydl_opts['cookiefile'] = str(COOKIE_FILE)
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = await to_thread(ydl.extract_info, url, download=False)
+            try:
+                ydl_opts_cookie = {'quiet': True, 'noplaylist': True, 'skip_download': True, 'cookiefile': str(COOKIE_FILE)}
+                with yt_dlp.YoutubeDL(ydl_opts_cookie) as ydl:
+                    info = await to_thread(ydl.extract_info, url, download=False)
+            except Exception as e_cookie:
+                logger.error(f"Failed to handle link {url} even with cookies: {e_cookie}")
+                await status_msg.edit_text("❌ Error: Could not process link. The cookie file may be invalid.")
+                return ConversationHandler.END
         else:
-            raise e # Re-raise other errors
+            logger.error(f"Failed to handle link {url}: {e}")
+            await status_msg.edit_text("❌ Error: Could not process link.")
+            return ConversationHandler.END
 
     if not info:
-        await status_msg.edit_text("❌ Error: Could not process link after all attempts.")
+        await status_msg.edit_text("❌ Error: Could not retrieve video information.")
         return ConversationHandler.END
 
     context.user_data.update({'url': url, 'info': info})
@@ -328,18 +334,14 @@ async def download_media(task: Dict[str, Any], application: Application):
     try:
         start_time = time.monotonic()
         
-        # --- THIS IS THE CRITICAL FIX ---
-        # The 'preferedformat' key (with one 'r') is the correct one for FFmpegVideoConvertor.
-        # The typo 'preferredformat' (with two 'r's) was causing the crash.
         ydl_opts = {
             'noplaylist': True, 'quiet': True, 'progress_hooks': [progress.get_progress_hook(start_time)],
             'outtmpl': str(DOWNLOAD_DIR / (f"{task['custom_filename']}.%(ext)s" if task['custom_filename'] else "%(title)s.%(ext)s")),
             'retries': 3, 'fragment_retries': 3,
             'http_headers': {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'},
-            'ignoreerrors': True, # Handles FFmpeg "errors" that aren't actually errors
+            'ignoreerrors': True,
         }
-
-        # Smart Cookie Logic: Only use cookies if necessary.
+        
         if COOKIE_FILE.exists():
             ydl_opts['cookiefile'] = str(COOKIE_FILE)
         
