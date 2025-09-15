@@ -324,7 +324,7 @@ async def download_media(task: Dict[str, Any], application: Application):
             'retries': 3, 'fragment_retries': 3,
             'http_headers': {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'},
             'postprocessor_hooks': [lambda d: logger.info(f"FFmpeg: {d.get('msg','').strip()}") if d['status'] == 'started' else None],
-            'ignoreerrors': 'only_download', # CRITICAL FIX for FFmpeg "errors"
+            'ignoreerrors': 'only_download',
         }
         if COOKIE_FILE.exists(): ydl_opts['cookiefile'] = str(COOKIE_FILE)
         
@@ -334,13 +334,20 @@ async def download_media(task: Dict[str, Any], application: Application):
             ydl_opts['format'] = f"{task['quality_id']}+bestaudio/best" if task['quality_id'] != 'best' else 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best'
             ydl_opts.setdefault('postprocessors', []).append({'key': 'FFmpegVideoConvertor', 'preferedformat': 'mp4'})
         
+        # --- CRITICAL FIX: Get the final path from the return value, not by guessing ---
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = await to_thread(ydl.extract_info, url, download=True)
-            final_path = Path(ydl.prepare_filename(info))
-            if task['format_choice'] == 'mp3' and final_path.suffix != '.mp3':
-                final_path = final_path.with_suffix('.mp3')
+            info_dict = await to_thread(ydl.extract_info, url, download=True)
+            # This is the reliable way to get the final file path after processing
+            final_path_str = info_dict.get('filepath') or info_dict.get('_filename')
+            if not final_path_str:
+                 raise FileNotFoundError("Could not determine final file path from yt-dlp.")
+            final_path = Path(final_path_str)
 
-        if not final_path or not final_path.exists(): raise FileNotFoundError("Downloaded file not found.")
+        if not final_path.exists():
+            # Wait a brief moment for the filesystem to catch up
+            await asyncio.sleep(1)
+            if not final_path.exists():
+                raise FileNotFoundError(f"Downloaded file not found at expected path: {final_path}")
 
         await progress.update(generate_progress_text("Uploading..."))
         if final_path.stat().st_size <= TELEGRAM_SAFE_MAX_BYTES:
@@ -354,7 +361,10 @@ async def download_media(task: Dict[str, Any], application: Application):
     except Exception as e:
         error_message = f"❌ Download failed. Error: {str(e)[:200]}"
         logger.exception(f"Error for URL {url}")
-        await progress.update(error_message)
+        try:
+            await progress.update(error_message)
+        except TelegramError: # Message might have been deleted
+             await application.bot.send_message(chat_id, error_message)
     finally:
         if final_path and final_path.exists():
             await to_thread(final_path.unlink)
