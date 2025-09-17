@@ -1,5 +1,9 @@
+# This file tells Railway to install system packages.
+
 [phases.setup]
+# Installs the ffmpeg package using the apt package manager.
 aptPkgs = [ "ffmpeg" ]
 
 [phases.start]
+# Sets the command to run the bot after setup.
 cmd = "python bot.py"
