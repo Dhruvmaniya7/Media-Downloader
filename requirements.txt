@@ -1,3 +1,3 @@
-python-telegram-bot[persistence]
+python-telegram-bot[persistence,job-queue]
 yt-dlp
 aiohttp
