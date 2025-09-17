@@ -336,7 +336,6 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         logger.error(f"Error: {e}")
         await status_msg.edit_text("❌ Unexpected error.")
         return ConversationHandler.END
-
     if not info:
         await status_msg.edit_text("❌ No information retrieved.")
         return ConversationHandler.END
@@ -350,7 +349,6 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     await status_msg.edit_text(f"*{title}*\nChoose an option:", reply_markup=InlineKeyboardMarkup(buttons), parse_mode=ParseMode.MARKDOWN)
     return CHOOSE_FORMAT
 
-
 async def ask_rename_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
@@ -358,7 +356,7 @@ async def ask_rename_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.edit_message_text("OK. Please send me the new filename (without the extension):")
         return GET_NEW_NAME
     else:
-        await queue_download(update, context, custom_filename=None)
+        await query.edit_message_text("Cancelled.")
         return ConversationHandler.END
 
 async def get_new_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -375,8 +373,13 @@ async def download_media(task: Dict[str, Any], application: Application):
     format_choice = task.get("format_choice", "best")
     custom_filename = task.get("custom_filename")
 
-    file_name = custom_filename or "downloaded_file"
-    file_path = DOWNLOAD_DIR / f"{sanitize_filename(file_name)}.mp4"
+    # Use title from info dict if custom_filename is not provided
+    info = task.get("info", {})
+    file_name = custom_filename or info.get("title", "downloaded_file")
+    
+    # Ensure the file extension is appropriate
+    ext = info.get('ext', 'mp4')
+    file_path = DOWNLOAD_DIR / f"{sanitize_filename(file_name)}.{ext}"
 
     progress = ProgressManager(application.bot, chat_id)
     await progress.send_initial_message()
@@ -393,11 +396,18 @@ async def download_media(task: Dict[str, Any], application: Application):
         ydl_opts['cookiefile'] = str(COOKIE_FILE)
 
     try:
-        async with DOWNLOAD_SEMAPHORE:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                await to_thread(ydl.download, [url])
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            await to_thread(ydl.download, [url])
+            
+            # Find the actual downloaded file path, as yt-dlp might change it
+            downloaded_files = list(DOWNLOAD_DIR.glob(f"{sanitize_filename(file_name)}*"))
+            if downloaded_files:
+                file_path = downloaded_files[0]
+            else:
+                 raise FileNotFoundError("Downloaded file not found!")
+
     except Exception as e:
-        logger.error(f"Download failed: {e}")
+        logger.error(f"Download failed for URL {url}: {e}")
         await progress.update(generate_progress_text("Download failed."))
         return
 
@@ -408,11 +418,11 @@ async def download_media(task: Dict[str, Any], application: Application):
         msg = f"✅ Download and upload complete!\n[{file_path.name}]({upload_link})"
         await progress.update(generate_progress_text("Upload complete!"))
     else:
-        msg = f"✅ Download complete!\nFile saved as `{file_path.name}`"
+        msg = f"✅ Download complete! Uploading failed.\nFile saved as `{file_path.name}` on server."
         await progress.update(generate_progress_text("Upload failed."))
 
     try:
-        await application.bot.send_message(chat_id, msg, parse_mode=ParseMode.MARKDOWN)
+        await application.bot.send_message(chat_id, msg, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
     except TelegramError as e:
         logger.error(f"Failed to send message: {e}")
 
@@ -431,7 +441,7 @@ def main():
     conv_handler = ConversationHandler(
         entry_points=[MessageHandler(filters.TEXT & (~filters.COMMAND), handle_link)],
         states={
-            CHOOSE_FORMAT: [CallbackQueryHandler(ask_rename_callback, pattern="download\|")],
+            CHOOSE_FORMAT: [CallbackQueryHandler(ask_rename_callback, pattern=r"^download\|(yes|no)$")],
             GET_NEW_NAME: [MessageHandler(filters.TEXT & (~filters.COMMAND), get_new_name)],
         },
         fallbacks=[],
@@ -447,4 +457,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
