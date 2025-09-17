@@ -7,23 +7,24 @@ Enhancements by: Luna
 Features:
 - yt-dlp with robust options, SMART COOKIE handling, and FFmpeg error correction.
 - Guaranteed, live, and animated progress bar updates visible to the user.
-- aiohttp for reliable, non-blocking uploads with multi-service fallbacks (GoFile, File.io, Transfer.sh).
+- aiohttp for reliable, non-blocking uploads with multi-service fallbacks.
 - Per-user queue with JSON persistence.
 - Global concurrency limit with asyncio.Semaphore.
 - PicklePersistence for conversation state.
 - **IMPROVED**: Granular error handling for better user feedback.
 - **IMPROVED**: More flexible if/else logic for format selection and file processing.
+- **IMPROVED**: Prioritized and more reliable upload services.
 """
 
 import os
 import re
 import json
 import time
+import math # <-- MAKE SURE THIS IS IMPORTED
 import asyncio
 import logging
 import shutil
 import yt_dlp
-import math
 import aiohttp
 from pathlib import Path
 from functools import partial
@@ -78,10 +79,9 @@ def sanitize_filename(name: str) -> str:
 
 def format_bytes(size_bytes: int) -> str:
     """Formats bytes into a human-readable string (KB, MB, GB)."""
-    if not size_bytes or size_bytes <= 0: # Added a check for zero/negative
+    if not size_bytes or size_bytes <= 0:
         return "0B"
     size_name = ("B", "KB", "MB", "GB", "TB")
-    # THE FIX IS HERE: Use math.log(number, base)
     i = int(math.log(abs(size_bytes), 1024))
     p = 1024 ** i
     s = round(size_bytes / p, 2)
@@ -153,7 +153,7 @@ class ProgressManager:
             asyncio.run_coroutine_threadsafe(
                 self.message.edit_text(text, parse_mode=ParseMode.MARKDOWN),
                 self.loop
-            ).result() # Using .result() can be blocking, but okay for quick updates.
+            )
 
     async def update(self, text: str):
         """Updates the progress message asynchronously."""
@@ -216,10 +216,13 @@ def load_queue_from_disk():
 # ---------------- Upload Helpers (Multi-service with better error handling) ----------------
 async def upload_file(file_path: Path, progress: ProgressManager) -> Optional[str]:
     """Tries to upload a file using a sequence of services, returning the first successful link."""
+    # --- THIS IS THE CRITICAL CHANGE ---
+    # Reordered for reliability and added a new uploader.
     uploaders = [
+        ("0x0.st", upload_to_0x0st),
+        ("Transfer.sh", upload_to_transfersh),
         ("GoFile", upload_to_gofile),
         ("File.io", upload_to_fileio),
-        ("Transfer.sh", upload_to_transfersh),
     ]
     for name, uploader_func in uploaders:
         await progress.update(generate_progress_text(f"Uploading to {name}..."))
@@ -233,24 +236,23 @@ async def upload_file(file_path: Path, progress: ProgressManager) -> Optional[st
                  logger.warning(f"{name} upload failed for {file_path.name}, trying next service.")
         except Exception as e:
             logger.error(f"An exception occurred during upload to {name}: {e}")
-            
+
     logger.error(f"All upload services failed for {file_path.name}.")
     return None
 
-async def _upload_with_aiohttp(url: str, file_path: str, method: str = 'POST') -> Optional[Dict[str, Any]]:
+async def _upload_with_aiohttp(url: str, file_path: str, method: str = 'POST', data_field: str = 'file') -> Optional[Dict[str, Any]]:
     """Generic aiohttp upload helper."""
     try:
         timeout = aiohttp.ClientTimeout(total=600) # 10 minute timeout for uploads
         async with aiohttp.ClientSession(timeout=timeout) as session:
             with open(file_path, "rb") as f:
                 data = aiohttp.FormData()
-                data.add_field("file", f, filename=Path(file_path).name)
-                
+                data.add_field(data_field, f, filename=Path(file_path).name)
+
                 request_method = session.post if method.upper() == 'POST' else session.put
-                
+
                 async with request_method(url, data=data if method.upper() == 'POST' else f) as resp:
                     resp.raise_for_status()
-                    # Check content type to avoid errors with non-JSON responses
                     if 'application/json' in resp.headers.get('Content-Type', ''):
                         return await resp.json()
                     return {"text": await resp.text()}
@@ -261,6 +263,12 @@ async def _upload_with_aiohttp(url: str, file_path: str, method: str = 'POST') -
     except Exception as e:
         logger.error(f"Generic upload error for {url}: {e}")
     return None
+
+# --- NEW UPLOADER FUNCTION ---
+async def upload_to_0x0st(file_path: str) -> Optional[str]:
+    """Uploads a file to 0x0.st and returns the link."""
+    response = await _upload_with_aiohttp("http://0x0.st", file_path)
+    return response.get("text").strip() if response and response.get("text") else None
 
 async def upload_to_gofile(file_path: str) -> Optional[str]:
     """Uploads a file to GoFile.io and returns the download link."""
@@ -279,7 +287,7 @@ async def upload_to_fileio(file_path: str) -> Optional[str]:
 async def upload_to_transfersh(file_path: str) -> Optional[str]:
     """Uploads a file to Transfer.sh and returns the download link."""
     response = await _upload_with_aiohttp(f"https://transfer.sh/{Path(file_path).name}", file_path, method='PUT')
-    return response.get("text") if response else None
+    return response.get("text").strip() if response else None
 
 
 # ---------------- Queue Operations ----------------
@@ -296,7 +304,7 @@ async def process_queue_for_user(user_id: str, application: Application):
         except Exception as e:
             logger.exception(f"Critical error in task processor for user {user_id}. Task: {task}. Error: {e}")
             await application.bot.send_message(task['chat_id'], f"A critical error occurred while processing your request for {task['url']}. The task has been skipped.")
-        
+
         # A small delay to prevent rapid-fire processing in case of errors
         await asyncio.sleep(1)
 
@@ -319,13 +327,11 @@ async def queue_download(update: Update, context: ContextTypes.DEFAULT_TYPE, cus
 
     position = len(DOWNLOAD_QUEUE[user_id_str])
     message_text = f"✅ Task added to your queue at position #{position}."
-    
+
     # Gracefully handle if the previous message was a callback or a regular message
     if update.callback_query:
         await update.callback_query.edit_message_text(message_text)
     else:
-        # If the user sent a filename, the original message is the link, reply to that
-        # Otherwise, reply to the new filename message
         if update.message:
             await update.message.reply_text(message_text)
 
@@ -355,7 +361,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     msg = update.message
     url = normalize_url(msg.text)
     status_msg = await msg.reply_text("🔍 Analyzing link, please wait...")
-    
+
     info = None
     try:
         ydl_opts = {
@@ -366,7 +372,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         }
         if COOKIE_FILE.exists():
             ydl_opts['cookiefile'] = str(COOKIE_FILE)
-            
+
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = await to_thread(ydl.extract_info, url, download=False)
 
@@ -407,7 +413,7 @@ async def choose_format_callback(update: Update, context: ContextTypes.DEFAULT_T
     query = update.callback_query
     await query.answer()
     context.user_data["format_choice"] = query.data.split("|")[1]
-    
+
     if context.user_data["format_choice"] == 'mp3':
         context.user_data['quality_id'] = 'bestaudio'
         buttons = [[InlineKeyboardButton("✏️ Rename File", callback_data='rename|yes'), InlineKeyboardButton("➡️ Keep Original Name", callback_data='rename|no')]]
@@ -419,7 +425,7 @@ async def choose_format_callback(update: Update, context: ContextTypes.DEFAULT_T
 
     # Filter for formats that are actually video and have resolution info
     video_formats = [f for f in info.get("formats", []) if f.get('vcodec', 'none') != 'none' and f.get('height')]
-    
+
     if not video_formats:
         # Fallback if no video streams found (e.g., soundcloud)
         await query.edit_message_text("No video formats found for this link. Please choose audio instead.", reply_markup=None)
@@ -438,13 +444,13 @@ async def choose_format_callback(update: Update, context: ContextTypes.DEFAULT_T
     # If after filtering we have no buttons, offer a generic best option
     if not buttons:
         buttons.append([InlineKeyboardButton("Best Available Quality", callback_data="quality|best")])
-    
+
     # Sort buttons by resolution, descending
     buttons.sort(
         key=lambda b: int(re.search(r'(\d+)p', b[0].text).group(1)) if re.search(r'(\d+)p', b[0].text) else 0,
         reverse=True
     )
-    
+
     await query.edit_message_text("Please select a video quality:", reply_markup=InlineKeyboardMarkup(buttons))
     return CHOOSE_QUALITY
 
@@ -484,7 +490,7 @@ async def cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text("✅ Your download queue has been cleared.")
     else:
         await update.message.reply_text("Your queue is already empty.")
-        
+
     # Also provides an exit point for any active conversation
     if 'info' in context.user_data:
         context.user_data.clear()
@@ -500,11 +506,11 @@ async def download_media(task: Dict[str, Any], application: Application):
     chat_id, url = task['chat_id'], task['url']
     progress = ProgressManager(application.bot, chat_id)
     await progress.send_initial_message("Preparing to download...")
-    
+
     final_path = None
     try:
         start_time = time.monotonic()
-        
+
         # Base yt-dlp options
         ydl_opts = {
             'noplaylist': True,
@@ -516,10 +522,10 @@ async def download_media(task: Dict[str, Any], application: Application):
             'http_headers': {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'},
             'ignoreerrors': True,
         }
-        
+
         if COOKIE_FILE.exists():
             ydl_opts['cookiefile'] = str(COOKIE_FILE)
-            
+
         # --- MORE FLEXIBLE FORMAT SELECTION LOGIC ---
         if task['format_choice'] == 'mp3':
             ydl_opts.update({
@@ -527,40 +533,31 @@ async def download_media(task: Dict[str, Any], application: Application):
                 'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '192'}]
             })
         else: # mp4
-            # This is a more robust format selector that handles cases where combined streams don't exist
             quality = task['quality_id']
-            # Select best video with chosen quality ID + best audio, OR best video/audio if separate streams are not available.
             ydl_opts['format'] = f"{quality}+bestaudio/bestvideo[height<=?{quality}]+bestaudio/best"
             ydl_opts.setdefault('postprocessors', []).append({'key': 'FFmpegVideoConvertor', 'preferedformat': 'mp4'})
-            # Add metadata postprocessor for embedding thumbnail etc.
             ydl_opts.setdefault('postprocessors', []).append({'key': 'FFmpegMetadata'})
 
         # Download starts here
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info_dict = await to_thread(ydl.extract_info, url, download=True)
-            
-            # Defensive check if download failed silently
+
             if not info_dict:
                 raise ValueError("yt-dlp failed to return media information after download attempt.")
-                
+
             final_path_str = ydl.prepare_filename(info_dict)
             if not final_path_str:
                 raise FileNotFoundError("Could not determine final file path from yt-dlp.")
-            
-            # Correct the extension based on the requested format
+
             temp_path = Path(final_path_str)
             if task['format_choice'] == 'mp3':
                 final_path = temp_path.with_suffix('.mp3')
             else:
                 final_path = temp_path.with_suffix('.mp4')
 
-            # yt-dlp sometimes creates the file with the original extension before post-processing.
-            # We need to find the correct final file.
             if not final_path.exists() and temp_path.exists():
-                # This means post-processing likely happened and the file was renamed
-                # e.g., from .webm to .mp4. Let's find it.
                 if final_path.exists():
-                     pass # Already correct
+                     pass
                 elif temp_path.with_suffix('.mp4').exists():
                     final_path = temp_path.with_suffix('.mp4')
                 elif temp_path.with_suffix('.mp3').exists():
@@ -572,7 +569,7 @@ async def download_media(task: Dict[str, Any], application: Application):
             await asyncio.sleep(2) # Wait for filesystem to catch up
             if not final_path or not final_path.exists():
                 raise FileNotFoundError(f"File not found at expected path after download: {final_path}")
-        
+
         file_size = final_path.stat().st_size
         if file_size < 1024: # Less than 1 KB is suspicious
             raise ValueError(f"Downloaded file is suspiciously small ({format_bytes(file_size)}). Download likely failed.")
@@ -591,13 +588,13 @@ async def download_media(task: Dict[str, Any], application: Application):
                 await application.bot.send_message(chat_id, "❌ All upload services failed. Could not upload the file.")
 
         await progress.delete()
-    
+
     except (yt_dlp.utils.DownloadError, ValueError, FileNotFoundError) as e:
         error_message = f"❌ Download failed. Reason: {str(e)[:200]}"
         logger.error(f"Download failure for URL {url}: {e}")
         try:
             await progress.update(error_message)
-        except TelegramError: # If progress message was deleted or invalid
+        except TelegramError:
             await application.bot.send_message(chat_id, error_message)
     except Exception as e:
         error_message = "❌ An unexpected critical error occurred during download."
@@ -624,7 +621,7 @@ def main():
     load_queue_from_disk()
     persistence = PicklePersistence(filepath=PERSISTENCE_FILE)
     application = Application.builder().token(BOT_TOKEN).persistence(persistence).build()
-    
+
     conv_handler = ConversationHandler(
         entry_points=[MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link)],
         states={
@@ -638,12 +635,12 @@ def main():
         persistent=True,
         name="download_conv"
     )
-    
+
     application.add_handler(CommandHandler("start", start_handler))
     application.add_handler(CommandHandler("sites", sites_handler))
     application.add_handler(CommandHandler("cancel", cancel_handler)) # A global cancel
     application.add_handler(conv_handler)
-    
+
     async def on_startup(app: Application):
         """Resumes any queued downloads when the bot restarts."""
         if any(DOWNLOAD_QUEUE.values()):
@@ -651,12 +648,11 @@ def main():
             logger.info(f"Resuming queues for users: {', '.join(active_users)}")
             for user_id in active_users:
                 asyncio.create_task(process_queue_for_user(user_id, app))
-    
+
     application.post_init = on_startup
-    
+
     logger.info("🚀 Bot is running!")
     application.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
-
