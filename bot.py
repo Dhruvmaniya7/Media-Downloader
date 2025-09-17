@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Ultimate Media Downloader Bot - ENHANCED, FLEXIBLE & ROBUST VERSION
+Ultimate Media Downloader Bot - FINAL, ROBUST & FLEXIBLE VERSION
 Author: Dhruv Maniya (shadow maniya)
 Enhancements by: Luna
 
@@ -12,7 +12,7 @@ Features:
 - Global concurrency limit with asyncio.Semaphore.
 - PicklePersistence for conversation state.
 - **IMPROVED**: Granular error handling for better user feedback.
-- **IMPROVED**: More flexible if/else logic for format selection and file processing.
+- **FINAL**: More flexible and robust format selection for high-quality video.
 - **IMPROVED**: Prioritized and more reliable upload services.
 """
 
@@ -20,7 +20,7 @@ import os
 import re
 import json
 import time
-import math # <-- MAKE SURE THIS IS IMPORTED
+import math
 import asyncio
 import logging
 import shutil
@@ -56,11 +56,11 @@ PERSISTENCE_FILE = "bot_persistence.pkl"
 COOKIE_FILE = Path("cookies.txt")
 
 SUPPORTED_SITES_LINK = "https://github.com/yt-dlp/yt-dlp/blob/master/supportedsites.md"
-WELCOME_IMAGE_URL = "https://i.ibb.co/bMNj87bT/download.jpg"
+WELCOME_IMAGE_URL = "https://i.ibb.co/MNj87bT/download.jpg"
 
 TELEGRAM_SAFE_MAX_BYTES = 49 * 1024 * 1024
 GLOBAL_MAX_CONCURRENT_DOWNLOADS = 3
-SPINNER_FRAMES = ["⢿", "⣻", "⣽", "⾾", "⣷", "⣯", "⣟", "⡿"]
+SPINNER_FRAMES = ["⢿", "⣻", "⣽", "⣾", "⣷", "⣯", "⣟", "⡿"]
 
 CHOOSE_FORMAT, CHOOSE_QUALITY, ASK_RENAME, GET_NEW_NAME = range(4)
 
@@ -82,7 +82,7 @@ def format_bytes(size_bytes: int) -> str:
     if not size_bytes or size_bytes <= 0:
         return "0B"
     size_name = ("B", "KB", "MB", "GB", "TB")
-    i = int(math.log(abs(size_bytes), 1024))
+    i = int(math.log(abs(size_bytes), 1024)) if size_bytes > 0 else 0
     p = 1024 ** i
     s = round(size_bytes / p, 2)
     return f"{s} {size_name[i]}"
@@ -112,7 +112,7 @@ def generate_progress_text(status_text: str, percent: Optional[float] = None, sp
 
 async def to_thread(func, *args, **kwargs):
     """Runs a synchronous function in a separate thread to avoid blocking asyncio loop."""
-    return await asyncio.to_thread(partial(func, *args, **kwargs))
+    return await asyncio.to_thread(func, *args, **kwargs)
 
 def normalize_url(url: str) -> str:
     """Normalizes common YouTube URL variations to a standard format."""
@@ -179,6 +179,7 @@ class ProgressManager:
         """Returns a progress hook function for yt-dlp."""
         def progress_hook(d):
             if d['status'] == 'finished':
+                # This hook is also called for post-processing, so provide a generic message.
                 self._update_message_threadsafe(generate_progress_text("Processing file..."))
                 return
 
@@ -216,8 +217,6 @@ def load_queue_from_disk():
 # ---------------- Upload Helpers (Multi-service with better error handling) ----------------
 async def upload_file(file_path: Path, progress: ProgressManager) -> Optional[str]:
     """Tries to upload a file using a sequence of services, returning the first successful link."""
-    # --- THIS IS THE CRITICAL CHANGE ---
-    # Reordered for reliability and added a new uploader.
     uploaders = [
         ("0x0.st", upload_to_0x0st),
         ("Transfer.sh", upload_to_transfersh),
@@ -233,7 +232,7 @@ async def upload_file(file_path: Path, progress: ProgressManager) -> Optional[st
                 logger.info(f"Successfully uploaded to {name}: {link}")
                 return link
             else:
-                 logger.warning(f"{name} upload failed for {file_path.name}, trying next service.")
+                logger.warning(f"{name} upload failed for {file_path.name}, trying next service.")
         except Exception as e:
             logger.error(f"An exception occurred during upload to {name}: {e}")
 
@@ -246,16 +245,18 @@ async def _upload_with_aiohttp(url: str, file_path: str, method: str = 'POST', d
         timeout = aiohttp.ClientTimeout(total=600) # 10 minute timeout for uploads
         async with aiohttp.ClientSession(timeout=timeout) as session:
             with open(file_path, "rb") as f:
-                data = aiohttp.FormData()
-                data.add_field(data_field, f, filename=Path(file_path).name)
-
-                request_method = session.post if method.upper() == 'POST' else session.put
-
-                async with request_method(url, data=data if method.upper() == 'POST' else f) as resp:
-                    resp.raise_for_status()
-                    if 'application/json' in resp.headers.get('Content-Type', ''):
-                        return await resp.json()
-                    return {"text": await resp.text()}
+                if method.upper() == 'POST':
+                    data = aiohttp.FormData()
+                    data.add_field(data_field, f, filename=Path(file_path).name)
+                    async with session.post(url, data=data) as resp:
+                        resp.raise_for_status()
+                        if 'application/json' in resp.headers.get('Content-Type', ''):
+                            return await resp.json()
+                        return {"text": await resp.text()}
+                else: # PUT
+                    async with session.put(url, data=f) as resp:
+                        resp.raise_for_status()
+                        return {"text": await resp.text()}
     except aiohttp.ClientError as e:
         logger.error(f"Network error during upload to {url}: {e}")
     except asyncio.TimeoutError:
@@ -264,7 +265,6 @@ async def _upload_with_aiohttp(url: str, file_path: str, method: str = 'POST', d
         logger.error(f"Generic upload error for {url}: {e}")
     return None
 
-# --- NEW UPLOADER FUNCTION ---
 async def upload_to_0x0st(file_path: str) -> Optional[str]:
     """Uploads a file to 0x0.st and returns the link."""
     response = await _upload_with_aiohttp("http://0x0.st", file_path)
@@ -287,7 +287,7 @@ async def upload_to_fileio(file_path: str) -> Optional[str]:
 async def upload_to_transfersh(file_path: str) -> Optional[str]:
     """Uploads a file to Transfer.sh and returns the download link."""
     response = await _upload_with_aiohttp(f"https://transfer.sh/{Path(file_path).name}", file_path, method='PUT')
-    return response.get("text").strip() if response else None
+    return response.get("text").strip() if response and response.get("text") else None
 
 
 # ---------------- Queue Operations ----------------
@@ -328,12 +328,10 @@ async def queue_download(update: Update, context: ContextTypes.DEFAULT_TYPE, cus
     position = len(DOWNLOAD_QUEUE[user_id_str])
     message_text = f"✅ Task added to your queue at position #{position}."
 
-    # Gracefully handle if the previous message was a callback or a regular message
     if update.callback_query:
         await update.callback_query.edit_message_text(message_text)
-    else:
-        if update.message:
-            await update.message.reply_text(message_text)
+    elif update.message:
+        await update.message.reply_text(message_text)
 
     # If the queue processor for this user is not running, start it.
     if len(DOWNLOAD_QUEUE[user_id_str]) == 1:
@@ -368,7 +366,6 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
             'quiet': True,
             'noplaylist': True,
             'skip_download': True,
-            'extract_flat': 'in_playlist' # Faster for playlists, though we disallow them
         }
         if COOKIE_FILE.exists():
             ydl_opts['cookiefile'] = str(COOKIE_FILE)
@@ -381,7 +378,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         error_text = "❌ Error: Could not process the link."
         if "Unsupported URL" in str(e):
             error_text = "❌ Error: This website or link is not supported."
-        elif "Video unavailable" in str(e):
+        elif "Video unavailable" in str(e) or "is not available" in str(e):
             error_text = "❌ Error: This video is unavailable."
         elif "Private video" in str(e):
             error_text = "❌ Error: This video is private."
@@ -414,22 +411,29 @@ async def choose_format_callback(update: Update, context: ContextTypes.DEFAULT_T
     await query.answer()
     context.user_data["format_choice"] = query.data.split("|")[1]
 
+    def get_rename_buttons() -> InlineKeyboardMarkup:
+        buttons = [[
+            InlineKeyboardButton("✏️ Rename File", callback_data='rename|yes'),
+            InlineKeyboardButton("➡️ Keep Original Name", callback_data='rename|no')
+        ]]
+        return InlineKeyboardMarkup(buttons)
+
     if context.user_data["format_choice"] == 'mp3':
         context.user_data['quality_id'] = 'bestaudio'
-        buttons = [[InlineKeyboardButton("✏️ Rename File", callback_data='rename|yes'), InlineKeyboardButton("➡️ Keep Original Name", callback_data='rename|no')]]
-        await query.edit_message_text("Do you want to rename the file?", reply_markup=InlineKeyboardMarkup(buttons))
+        await query.edit_message_text("Do you want to rename the file?", reply_markup=get_rename_buttons())
         return ASK_RENAME
 
     info = context.user_data.get("info", {})
     buttons, seen_heights = [], set()
 
-    # Filter for formats that are actually video and have resolution info
     video_formats = [f for f in info.get("formats", []) if f.get('vcodec', 'none') != 'none' and f.get('height')]
 
     if not video_formats:
-        # Fallback if no video streams found (e.g., soundcloud)
         await query.edit_message_text("No video formats found for this link. Please choose audio instead.", reply_markup=None)
         return ConversationHandler.END
+
+    # Sort formats by height to process them logically
+    video_formats.sort(key=lambda f: f.get('height', 0), reverse=True)
 
     for f in video_formats:
         height = f.get('height')
@@ -439,18 +443,14 @@ async def choose_format_callback(update: Update, context: ContextTypes.DEFAULT_T
             label = f"{height}p"
             if filesize:
                 label += f" (~{format_bytes(filesize)})"
-            buttons.append([InlineKeyboardButton(label, callback_data=f"quality|{f['format_id']}")])
+            
+            # Use format_id for better accuracy
+            buttons.append([InlineKeyboardButton(label, callback_data=f"quality|{height}")])
 
-    # If after filtering we have no buttons, offer a generic best option
     if not buttons:
+        # Fallback if no valid formats were found
         buttons.append([InlineKeyboardButton("Best Available Quality", callback_data="quality|best")])
-
-    # Sort buttons by resolution, descending
-    buttons.sort(
-        key=lambda b: int(re.search(r'(\d+)p', b[0].text).group(1)) if re.search(r'(\d+)p', b[0].text) else 0,
-        reverse=True
-    )
-
+    
     await query.edit_message_text("Please select a video quality:", reply_markup=InlineKeyboardMarkup(buttons))
     return CHOOSE_QUALITY
 
@@ -460,8 +460,15 @@ async def choose_quality_callback(update: Update, context: ContextTypes.DEFAULT_
     query = update.callback_query
     await query.answer()
     context.user_data['quality_id'] = query.data.split("|")[1]
-    buttons = [[InlineKeyboardButton("✏️ Rename File", callback_data='rename|yes'), InlineKeyboardButton("➡️ Keep Original Name", callback_data='rename|no')]]
-    await query.edit_message_text("Do you want to rename the file?", reply_markup=InlineKeyboardMarkup(buttons))
+    
+    def get_rename_buttons() -> InlineKeyboardMarkup:
+        buttons = [[
+            InlineKeyboardButton("✏️ Rename File", callback_data='rename|yes'),
+            InlineKeyboardButton("➡️ Keep Original Name", callback_data='rename|no')
+        ]]
+        return InlineKeyboardMarkup(buttons)
+        
+    await query.edit_message_text("Do you want to rename the file?", reply_markup=get_rename_buttons())
     return ASK_RENAME
 
 async def ask_rename_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -526,18 +533,35 @@ async def download_media(task: Dict[str, Any], application: Application):
         if COOKIE_FILE.exists():
             ydl_opts['cookiefile'] = str(COOKIE_FILE)
 
-        # --- MORE FLEXIBLE FORMAT SELECTION LOGIC ---
+        # --- FINALIZED, ROBUST FORMAT SELECTION LOGIC ---
         if task['format_choice'] == 'mp3':
             ydl_opts.update({
                 'format': 'bestaudio/best',
-                'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '192'}]
+                'postprocessors': [{
+                    'key': 'FFmpegExtractAudio',
+                    'preferredcodec': 'mp3',
+                    'preferredquality': '192',
+                }],
             })
         else: # mp4
             quality = task['quality_id']
-            ydl_opts['format'] = f"{quality}+bestaudio/bestvideo[height<=?{quality}]+bestaudio/best"
-            ydl_opts.setdefault('postprocessors', []).append({'key': 'FFmpegVideoConvertor', 'preferedformat': 'mp4'})
-            ydl_opts.setdefault('postprocessors', []).append({'key': 'FFmpegMetadata'})
+            # This is the key change: Let yt-dlp pick the best formats (mp4/webm) and merge them.
+            # Then, use a post-processor to ensure the final container is MP4.
+            format_spec = f"bestvideo[height<=?{quality}]+bestaudio/best[height<=?{quality}]/best"
+            if quality == 'best':
+                 format_spec = "bestvideo+bestaudio/best"
 
+            ydl_opts.update({
+                'format': format_spec,
+                'postprocessors': [{
+                    'key': 'FFmpegVideoConvertor',
+                    'preferedformat': 'mp4',
+                }, {
+                    'key': 'FFmpegMetadata'
+                }],
+            })
+
+        info_dict = None
         # Download starts here
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info_dict = await to_thread(ydl.extract_info, url, download=True)
@@ -545,30 +569,33 @@ async def download_media(task: Dict[str, Any], application: Application):
             if not info_dict:
                 raise ValueError("yt-dlp failed to return media information after download attempt.")
 
-            final_path_str = ydl.prepare_filename(info_dict)
-            if not final_path_str:
-                raise FileNotFoundError("Could not determine final file path from yt-dlp.")
-
-            temp_path = Path(final_path_str)
+            # Correctly determine the final path after post-processing
+            base_path_str = ydl.prepare_filename(info_dict)
+            if not base_path_str:
+                raise FileNotFoundError("Could not determine file path from yt-dlp.")
+            
+            temp_path = Path(base_path_str)
             if task['format_choice'] == 'mp3':
                 final_path = temp_path.with_suffix('.mp3')
             else:
                 final_path = temp_path.with_suffix('.mp4')
 
-            if not final_path.exists() and temp_path.exists():
-                if final_path.exists():
-                     pass
-                elif temp_path.with_suffix('.mp4').exists():
-                    final_path = temp_path.with_suffix('.mp4')
-                elif temp_path.with_suffix('.mp3').exists():
-                    final_path = temp_path.with_suffix('.mp3')
-
-
+            # Ensure the file exists at the expected final path
+            if not final_path.exists():
+                # Post-processing might have created the original file, which needs to be moved
+                if temp_path.exists() and temp_path.is_file():
+                    try:
+                        shutil.move(temp_path, final_path)
+                        logger.info(f"Moved {temp_path} to {final_path}")
+                    except Exception as e:
+                        logger.error(f"Failed to move file: {e}")
+                else:
+                    # Give the filesystem a moment to catch up
+                    await asyncio.sleep(2)
+        
         # --- MORE ROBUST FILE VALIDATION ---
         if not final_path or not final_path.exists():
-            await asyncio.sleep(2) # Wait for filesystem to catch up
-            if not final_path or not final_path.exists():
-                raise FileNotFoundError(f"File not found at expected path after download: {final_path}")
+            raise FileNotFoundError(f"File not found at expected path after download and processing: {final_path}")
 
         file_size = final_path.stat().st_size
         if file_size < 1024: # Less than 1 KB is suspicious
@@ -593,20 +620,26 @@ async def download_media(task: Dict[str, Any], application: Application):
         error_message = f"❌ Download failed. Reason: {str(e)[:200]}"
         logger.error(f"Download failure for URL {url}: {e}")
         try:
-            await progress.update(error_message)
+            if progress.message:
+                await progress.update(error_message)
+            else:
+                await application.bot.send_message(chat_id, error_message)
         except TelegramError:
             await application.bot.send_message(chat_id, error_message)
     except Exception as e:
         error_message = "❌ An unexpected critical error occurred during download."
         logger.exception(f"CRITICAL FAILURE for URL {url}")
         try:
-            await progress.update(error_message)
+            if progress.message:
+                await progress.update(error_message)
+            else:
+                await application.bot.send_message(chat_id, error_message)
         except TelegramError:
             await application.bot.send_message(chat_id, error_message)
     finally:
         # Cleanup: ensure the downloaded file is deleted
         if final_path and final_path.exists():
-            await to_thread(final_path.unlink)
+            await to_thread(os.remove, final_path)
             logger.info(f"Successfully cleaned up: {final_path.name}")
 
 
