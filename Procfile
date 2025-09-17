@@ -1,1 +1,1 @@
-Media downloader: python bot.py
+worker: python bot.py
