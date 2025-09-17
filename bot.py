@@ -336,17 +336,20 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         logger.error(f"Error: {e}")
         await status_msg.edit_text("❌ Unexpected error.")
         return ConversationHandler.END
+
     if not info:
         await status_msg.edit_text("❌ No information retrieved.")
         return ConversationHandler.END
+
     context.user_data.update({"url": url, "info": info})
     title = info.get("title", "Unknown Title")
-        buttons = [
+    buttons = [
         [InlineKeyboardButton("Download", callback_data="download|yes")],
         [InlineKeyboardButton("Cancel", callback_data="download|no")]
     ]
     await status_msg.edit_text(f"*{title}*\nChoose an option:", reply_markup=InlineKeyboardMarkup(buttons), parse_mode=ParseMode.MARKDOWN)
     return CHOOSE_FORMAT
+
 
 async def ask_rename_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
@@ -444,3 +447,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
