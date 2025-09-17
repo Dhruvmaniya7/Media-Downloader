@@ -23,6 +23,7 @@ import asyncio
 import logging
 import shutil
 import yt_dlp
+import math
 import aiohttp
 from pathlib import Path
 from functools import partial
@@ -77,10 +78,11 @@ def sanitize_filename(name: str) -> str:
 
 def format_bytes(size_bytes: int) -> str:
     """Formats bytes into a human-readable string (KB, MB, GB)."""
-    if not size_bytes:
+    if not size_bytes or size_bytes <= 0: # Added a check for zero/negative
         return "0B"
     size_name = ("B", "KB", "MB", "GB", "TB")
-    i = int(abs(size_bytes).log(1024))
+    # THE FIX IS HERE: Use math.log(number, base)
+    i = int(math.log(abs(size_bytes), 1024))
     p = 1024 ** i
     s = round(size_bytes / p, 2)
     return f"{s} {size_name[i]}"
@@ -657,3 +659,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
